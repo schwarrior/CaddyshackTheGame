@@ -1,0 +1,2488 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Caddyshack: The Game</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+<style>
+  :root { color-scheme: dark; --ground: #0d1a0f; --ink: #e8f0d8; }
+  html, body { height: 100%; margin: 0; background: var(--ground); color: var(--ink); overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--ground); }
+  #game { image-rendering: pixelated; image-rendering: crisp-edges; background: #000; outline: none; box-shadow: 0 0 0 2px #1f3a22, 0 12px 40px rgba(0,0,0,.6); }
+  #boot { position: fixed; left: 0; right: 0; bottom: 12px; text-align: center; font: 10px "Press Start 2P", "Courier New", monospace; color: #7fa36f; pointer-events: none; }
+</style>
+<div id="stage"><canvas id="game" width="640" height="360" tabindex="0"></canvas></div>
+<div id="boot">Keyboard or gamepad. Click the game if keys don't respond.</div>
+<script>
+'use strict';
+// ============================================================
+//  ENGINE: canvas, text, input (keyboard + gamepad), audio,
+//  dialog / choice / fades / timers, game state
+// ============================================================
+const W = 640, H = 360;
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const FONT = '"Press Start 2P","Courier New",monospace';
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H) || 1;
+  cv.style.width = Math.floor(W * s) + 'px';
+  cv.style.height = Math.floor(H * s) + 'px';
+}
+addEventListener('resize', fit); fit();
+cv.addEventListener('mousedown', () => { cv.focus(); audioInit(); });
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+function hash2(x, y) {
+  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function R(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); }
+const SHADES = {};
+function shade(hex, f) {
+  const k = hex + f; if (SHADES[k]) return SHADES[k];
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, Math.round((n >> 16 & 255) * f)), g = Math.min(255, Math.round((n >> 8 & 255) * f)), b = Math.min(255, Math.round((n & 255) * f));
+  return SHADES[k] = 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+// ---------------- text ----------------
+function txt(s, x, y, col = '#fff', size = 8, align = 'left', sh = '#000') {
+  ctx.font = size + 'px ' + FONT; ctx.textAlign = align; ctx.textBaseline = 'top';
+  if (sh) { ctx.fillStyle = sh; const o = Math.max(1, size / 8); ctx.fillText(s, x + o, y + o); }
+  ctx.fillStyle = col; ctx.fillText(s, x, y);
+}
+function otxt(s, x, y, col = '#fff', size = 8, align = 'center') {
+  ctx.font = size + 'px ' + FONT; ctx.textAlign = align; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#000';
+  for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) ctx.fillText(s, x + dx, y + dy);
+  ctx.fillStyle = col; ctx.fillText(s, x, y);
+}
+function wrap(s, maxC) {
+  const out = [];
+  for (const para of String(s).split('\n')) {
+    let line = '';
+    for (const w of para.split(' ')) {
+      if ((line + (line ? ' ' : '') + w).length > maxC && line) { out.push(line); line = w; }
+      else line += (line ? ' ' : '') + w;
+    }
+    out.push(line);
+  }
+  return out;
+}
+function panel(x, y, w, h, bg = 'rgba(8,16,10,.88)', edge = '#c9a94a') {
+  R(x, y, w, h, bg); R(x, y, w, 2, edge); R(x, y + h - 2, w, 2, edge); R(x, y, 2, h, edge); R(x + w - 2, y, 2, h, edge);
+}
+
+// ---------------- input ----------------
+const KEYS = {
+  ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
+  KeyA: 'left', KeyD: 'right', KeyW: 'up', KeyS: 'down',
+  Enter: 'a', Space: 'a', KeyZ: 'a', KeyJ: 'a',
+  Escape: 'b', KeyX: 'b', Backspace: 'b', KeyK: 'b',
+  KeyC: 'x', KeyL: 'x', Tab: 'y', KeyV: 'y', KeyI: 'y',
+  KeyQ: 'lb', KeyE: 'rb', KeyP: 'start', F1: 'start', KeyM: 'mute', KeyF: 'full',
+  Digit1: 'v1', Digit2: 'v2', Digit3: 'v3', Digit4: 'v4', Digit5: 'v5', Digit6: 'v6'
+};
+const ACTS = ['left', 'right', 'up', 'down', 'a', 'b', 'x', 'y', 'lb', 'rb', 'start', 'mute', 'full', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6'];
+const kb = {}, kbTap = {};
+addEventListener('keydown', e => {
+  const a = KEYS[e.code];
+  if (a) { kb[a] = true; if (!e.repeat) kbTap[a] = true; e.preventDefault(); }
+  audioInit();
+});
+addEventListener('keyup', e => { const a = KEYS[e.code]; if (a) { kb[a] = false; e.preventDefault(); } });
+addEventListener('blur', () => { for (const k in kb) kb[k] = false; });
+const IN = { down: {}, prev: {}, held: {}, eaten: {}, pad: false };
+let lastDt = 1 / 60;
+function pollInput(dt) {
+  const cur = {};
+  for (const a of ACTS) { cur[a] = !!kb[a] || !!kbTap[a]; kbTap[a] = false; }
+  let pads = [];
+  try { pads = navigator.getGamepads ? navigator.getGamepads() : []; } catch (e) { pads = []; }
+  for (const p of pads) {
+    if (!p) continue;
+    const b = i => p.buttons[i] && p.buttons[i].pressed;
+    if (b(0)) cur.a = true; if (b(1)) cur.b = true; if (b(2)) cur.x = true; if (b(3)) cur.y = true;
+    if (b(4) || b(6)) cur.lb = true; if (b(5) || b(7)) cur.rb = true;
+    if (b(8)) cur.mute = true; if (b(9)) cur.start = true;
+    if (b(12)) cur.up = true; if (b(13)) cur.down = true; if (b(14)) cur.left = true; if (b(15)) cur.right = true;
+    const ax = p.axes[0] || 0, ay = p.axes[1] || 0;
+    if (ax < -.5) cur.left = true; if (ax > .5) cur.right = true; if (ay < -.5) cur.up = true; if (ay > .5) cur.down = true;
+    if (p.buttons.some(x => x && x.pressed)) { IN.pad = true; audioInit(); }
+  }
+  for (const a of ACTS) {
+    IN.prev[a] = IN.down[a]; IN.down[a] = cur[a];
+    IN.held[a] = cur[a] ? (IN.held[a] || 0) + dt : 0;
+    IN.eaten[a] = false;
+  }
+}
+const isDown = a => !!IN.down[a];
+function hit(a) { if (IN.down[a] && !IN.prev[a] && !IN.eaten[a]) { IN.eaten[a] = true; return true; } return false; }
+function rep(a) {
+  if (hit(a)) return true;
+  const h = IN.held[a];
+  if (h > .32 && !IN.eaten[a]) {
+    const k = Math.floor((h - .32) / .09), pk = Math.floor((h - .32 - lastDt) / .09);
+    if (k !== pk) { IN.eaten[a] = true; return true; }
+  }
+  return false;
+}
+
+// ---------------- audio ----------------
+let AC = null, MASTER = null, muted = false, NBUF = null;
+function audioInit() {
+  try {
+    if (!AC) {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      MASTER = AC.createGain(); MASTER.gain.value = .7; MASTER.connect(AC.destination);
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { }
+}
+function tone(f, d, type = 'square', v = .06, f2 = null, delay = 0) {
+  if (!AC || muted) return;
+  const t = AC.currentTime + delay;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(.0001, t + d);
+  o.connect(g); g.connect(MASTER); o.start(t); o.stop(t + d + .02);
+}
+function noise(d, v = .1, freq = 1000, delay = 0, type = 'lowpass') {
+  if (!AC || muted) return;
+  if (!NBUF) {
+    NBUF = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+    const ch = NBUF.getChannelData(0); for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1;
+  }
+  const t = AC.currentTime + delay;
+  const s = AC.createBufferSource(); s.buffer = NBUF;
+  const f = AC.createBiquadFilter(); f.type = type; f.frequency.value = freq;
+  const g = AC.createGain(); g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(.0001, t + d);
+  s.connect(f); f.connect(g); g.connect(MASTER); s.start(t); s.stop(t + d + .05);
+}
+const SFX = {
+  blip() { tone(660, .03, 'square', .025); },
+  move() { tone(440, .04, 'square', .035); },
+  ok() { tone(660, .06, 'square', .05); tone(990, .08, 'square', .05, null, .06); },
+  no() { tone(200, .14, 'square', .05, 110); },
+  item() { [523, 659, 784, 1046].forEach((f, i) => tone(f, .1, 'square', .05, null, i * .07)); },
+  swing() { noise(.22, .14, 1500, 0, 'bandpass'); },
+  hit() { tone(900, .05, 'triangle', .2, 300); noise(.04, .15, 4000, 0, 'highpass'); },
+  putt() { tone(520, .05, 'triangle', .14, 260); },
+  land() { tone(140, .06, 'triangle', .12, 90); },
+  cup() { tone(330, .07, 'sine', .22); tone(220, .12, 'sine', .22, null, .08); tone(160, .15, 'sine', .15, null, .18); },
+  splash() { noise(.6, .28, 900); },
+  thwack() { tone(150, .08, 'square', .1, 80); noise(.12, .22, 2000); },
+  sand() { noise(.25, .16, 600); },
+  cheer() { [523, 659, 784, 1046, 1318].forEach((f, i) => tone(f, .16, 'square', .05, null, i * .09)); },
+  fail() { [392, 330, 262, 196].forEach((f, i) => tone(f, .22, 'triangle', .09, null, i * .17)); },
+  ring() { for (let k = 0; k < 2; k++) for (let i = 0; i < 8; i++) tone(i % 2 ? 1400 : 1150, .045, 'square', .035, null, k * .7 + i * .045); },
+  door() { tone(110, .12, 'square', .06, 80); tone(90, .1, 'square', .05, 60, .1); },
+  bonk() { tone(700, .08, 'square', .09, 1500); tone(1500, .1, 'square', .05, 700, .08); },
+  thunder() { noise(1.8, .4, 180); },
+  whistle() { tone(2300, .35, 'square', .04, 2600); tone(2300, .35, 'square', .04, 2600, .4); },
+  scream() { tone(700, .7, 'sawtooth', .05, 1600); },
+  coin() { tone(988, .06, 'square', .05); tone(1318, .18, 'square', .05, null, .06); },
+  lip() { tone(420, .05, 'triangle', .12, 600); },
+};
+
+// ---- tiny chiptune sequencer (original tunes) ----
+const SONGS = {
+  title: { bpm: 150, mel: [67, 0, 72, 0, 72, 74, 76, 0, 76, 74, 72, 74, 76, 0, 79, 0, 81, 0, 79, 76, 74, 0, 72, 74, 76, 0, 74, 0, 72, 0, 0, 0],
+    bass: [48, 0, 60, 0, 55, 0, 60, 0, 53, 0, 65, 0, 57, 0, 65, 0, 50, 0, 62, 0, 55, 0, 62, 0, 48, 0, 55, 0, 48, 0, 43, 0] },
+  adv: { bpm: 126, mel: [72, 0, 76, 79, 77, 76, 74, 0, 72, 74, 76, 72, 69, 0, 67, 0, 72, 0, 76, 79, 81, 79, 77, 76, 74, 72, 74, 76, 72, 0, 0, 0],
+    bass: [48, 0, 55, 0, 53, 0, 55, 0, 48, 0, 55, 0, 45, 0, 43, 0, 48, 0, 55, 0, 53, 0, 50, 0, 43, 0, 47, 0, 48, 0, 43, 0] },
+  golf: { bpm: 104, mel: [79, 0, 76, 0, 74, 76, 79, 0, 81, 0, 79, 76, 74, 0, 72, 0, 76, 0, 74, 72, 69, 0, 72, 0, 74, 0, 0, 0, 0, 0, 0, 0],
+    bass: [48, 0, 52, 0, 55, 0, 52, 0, 53, 0, 57, 0, 60, 0, 57, 0, 45, 0, 48, 0, 52, 0, 48, 0, 43, 0, 47, 0, 50, 0, 47, 0] },
+  tourney: { bpm: 118, mel: [69, 0, 72, 0, 76, 0, 74, 72, 71, 0, 68, 0, 64, 0, 0, 0, 69, 0, 72, 76, 79, 0, 77, 76, 74, 0, 71, 0, 69, 0, 0, 0],
+    bass: [45, 0, 45, 57, 45, 0, 45, 57, 40, 0, 40, 52, 40, 0, 40, 52, 41, 0, 41, 53, 43, 0, 43, 55, 40, 0, 44, 0, 45, 0, 0, 0] },
+  sad: { bpm: 70, mel: [64, 0, 62, 0, 60, 0, 59, 0, 57, 0, 0, 0, 0, 0, 0, 0], bass: [45, 0, 0, 0, 43, 0, 0, 0, 41, 0, 0, 0, 40, 0, 0, 0], wave: 'triangle' },
+};
+let SONG = null, songStep = 0, songNext = 0;
+const mfreq = n => 440 * Math.pow(2, (n - 69) / 12);
+function playSong(id) { const s = SONGS[id] || null; if (SONG === s) return; SONG = s; songStep = 0; songNext = 0; }
+setInterval(() => {
+  if (!AC || !SONG || muted) return;
+  const st = 60 / SONG.bpm / 2;
+  if (songNext < AC.currentTime) songNext = AC.currentTime + .05;
+  while (songNext < AC.currentTime + .2) {
+    const i = songStep % SONG.mel.length, m = SONG.mel[i], b = SONG.bass[i % SONG.bass.length];
+    const d = songNext - AC.currentTime;
+    if (m) tone(mfreq(m), st * .85, SONG.wave || 'square', .018, null, d);
+    if (b) tone(mfreq(b), st * .9, 'triangle', .045, null, d);
+    songStep++; songNext += st;
+  }
+}, 40);
+function toggleMute() { muted = !muted; toast(muted ? 'Sound OFF' : 'Sound ON'); }
+
+// ---------------- timers / scripting ----------------
+let TIMERS = [];
+function wait(s) { return new Promise(r => TIMERS.push({ t: s, r })); }
+function updateTimers(dt) {
+  if (!TIMERS.length) return;
+  const keep = [];
+  for (const t of TIMERS) { t.t -= dt; if (t.t <= 0) t.r(); else keep.push(t); }
+  TIMERS = keep;
+}
+let BUSY = 0;
+async function run(fn) { BUSY++; try { await fn(); } catch (e) { console.error(e); } finally { BUSY--; } }
+
+// ---------------- dialog ----------------
+// Speakers are keys into CH (defined in art.js). Text shows at the top of the screen in the speaker's color.
+const DLG = { cur: null };
+function say(who, text) {
+  return new Promise(res => { DLG.cur = { who, text, shown: 0, res, lines: wrap(text, 64), t: 0 }; });
+}
+function updateDlg(dt) {
+  const d = DLG.cur; if (!d) return;
+  const len = d.text.length; const before = Math.floor(d.shown);
+  d.shown = Math.min(len, d.shown + dt * 55); d.t += dt;
+  if (Math.floor(d.shown) > before && Math.floor(d.shown) % 3 === 0 && d.shown < len) SFX.blip();
+  if (hit('a') || hit('b')) {
+    if (d.shown < len) d.shown = len;
+    else { DLG.cur = null; d.res(); }
+  }
+}
+function drawDlg() {
+  const d = DLG.cur; if (!d) return;
+  const c = CH[d.who] || CH.nar;
+  const n = d.lines.length, h = 22 + n * 12;
+  R(0, 0, W, h, 'rgba(0,0,0,.78)'); R(0, h, W, 2, c.col);
+  let left = Math.floor(d.shown);
+  if (c.name) txt(c.name.toUpperCase(), 12, 5, c.col, 8, 'left');
+  d.lines.forEach((ln, i) => {
+    const part = ln.slice(0, Math.max(0, left)); left -= ln.length + 1;
+    txt(part, W / 2, 17 + i * 12, c.col === '#ffffff' && !c.name ? '#fff' : c.col, 8, 'center');
+  });
+  if (d.shown >= d.text.length && Math.floor(d.t * 3) % 2) txt('▼', W - 18, h - 12, c.col, 8);
+}
+
+// ---------------- choice menu ----------------
+const CHOICE = { cur: null };
+function choose(prompt, opts, cancelIdx = -1) {
+  return new Promise(res => { CHOICE.cur = { prompt, opts, i: 0, res, cancelIdx }; });
+}
+function updateChoice() {
+  const c = CHOICE.cur; if (!c) return;
+  if (rep('up')) { c.i = (c.i + c.opts.length - 1) % c.opts.length; SFX.move(); }
+  if (rep('down')) { c.i = (c.i + 1) % c.opts.length; SFX.move(); }
+  if (hit('a')) { SFX.ok(); CHOICE.cur = null; c.res(c.i); }
+  else if (hit('b') && c.cancelIdx >= 0) { SFX.no(); CHOICE.cur = null; c.res(c.cancelIdx); }
+}
+function drawChoice() {
+  const c = CHOICE.cur; if (!c) return;
+  const pl = wrap(c.prompt, 44);
+  const w = 400, h = 30 + pl.length * 12 + c.opts.length * 16, x = (W - w) / 2, y = (H - h) / 2 - 10;
+  panel(x, y, w, h);
+  pl.forEach((l, i) => txt(l, W / 2, y + 10 + i * 12, '#ffe79a', 8, 'center'));
+  c.opts.forEach((o, i) => {
+    const yy = y + 20 + pl.length * 12 + i * 16;
+    if (i === c.i) { R(x + 12, yy - 3, w - 24, 14, '#2f5d36'); txt('►', x + 18, yy, '#fff'); }
+    txt(o, x + 36, yy, i === c.i ? '#fff' : '#a8c49a');
+  });
+}
+
+// ---------------- toasts / fades ----------------
+let TOASTS = [];
+function toast(t, col = '#ffe066') { TOASTS.push({ t, col, life: 2.2 }); }
+function drawToasts(dt) {
+  TOASTS = TOASTS.filter(t => (t.life -= dt) > 0);
+  TOASTS.forEach((t, i) => {
+    const w = t.t.length * 8 + 24, y = 200 - i * 22;
+    ctx.globalAlpha = Math.min(1, t.life * 2);
+    panel((W - w) / 2, y, w, 20, 'rgba(0,0,0,.85)', t.col);
+    txt(t.t, W / 2, y + 6, t.col, 8, 'center');
+    ctx.globalAlpha = 1;
+  });
+}
+const FADE = { a: 0, to: 0, sp: 3, res: null };
+function fadeTo(v, time = .35) { return new Promise(res => { FADE.to = v; FADE.sp = 1 / time; FADE.res = res; }); }
+const fadeOut = t => fadeTo(1, t), fadeIn = t => fadeTo(0, t);
+function updateFade(dt) {
+  if (FADE.a === FADE.to) { if (FADE.res) { const r = FADE.res; FADE.res = null; r(); } return; }
+  FADE.a = FADE.a < FADE.to ? Math.min(FADE.to, FADE.a + FADE.sp * dt) : Math.max(FADE.to, FADE.a - FADE.sp * dt);
+}
+
+// ---------------- game state ----------------
+let G = null;
+const F = new Proxy({}, { get: (_, k) => G && G.flags[k], set: (_, k, v) => { G.flags[k] = v; return true; } });
+function newGame() { G = { stage: 0, money: 0, inv: [], flags: {}, room: 'caddyshack', x: 150, tScores: [], tHole: 0 }; }
+function saveGame() { try { localStorage.setItem('caddyshack_save_v1', JSON.stringify(G)); } catch (e) { } }
+function loadGame() {
+  try { const s = localStorage.getItem('caddyshack_save_v1'); if (s) { G = JSON.parse(s); return true; } } catch (e) { }
+  return false;
+}
+function hasSave() { try { return !!localStorage.getItem('caddyshack_save_v1'); } catch (e) { return false; } }
+function has(id) { return G.inv.includes(id); }
+function giveItem(id) { if (!has(id)) G.inv.push(id); SFX.item(); toast('Got: ' + ITEMS[id].name); }
+function takeItem(id) { const i = G.inv.indexOf(id); if (i >= 0) G.inv.splice(i, 1); if (typeof ADV !== 'undefined') ADV.item = -1; }
+function addMoney(n) { G.money += n; SFX.coin(); toast((n >= 0 ? '+$' : '-$') + Math.abs(n) + '   (Total $' + G.money + ')', '#9dff8a'); }
+
+let SCENE = null;
+function setScene(s) { SCENE = s; if (s.enter) s.enter(); }
+
+// ============================================================
+//  ART: characters, sprites, item icons (all procedural pixels)
+// ============================================================
+const CH = {
+  nar: { name: '', col: '#ffffff' },
+  kip: { name: 'Kip', col: '#ffffff', sp: { skin: '#f1c39b', hair: '#b5652a', hs: 'short', shirt: '#f4f4f4', pants: '#ececec', shoe: '#6b3b1b', bib: '#1f8a45' } },
+  lou: { name: 'Lou Loomis', col: '#ffb347', sp: { skin: '#e9b98f', hair: '#6a6a6a', hs: 'bald', shirt: '#d9482b', pattern: '#ffd166', pants: '#3b3b5c', shoe: '#222222', w: 9, glasses: 1 } },
+  tony: { name: "Tony D'Annunzio", col: '#9fd3ff', sp: { skin: '#d9a579', hair: '#1b1b1b', hs: 'curly', shirt: '#f4f4f4', pants: '#ececec', shoe: '#333333', bib: '#1f8a45', tissue: 1 } },
+  smails: { name: 'Judge Smails', col: '#8fb8ff', sp: { skin: '#f0c8a8', hair: '#f2f2f2', hs: 'short', shirt: '#1d2b5a', jacket: 1, pants: '#b8322a', shoe: '#ffffff', glasses: 1, leg: 8 } },
+  ty: { name: 'Ty Webb', col: '#ffe27a', sp: { skin: '#f3caa0', hair: '#f0cf62', hs: 'feather', shirt: '#f6e27f', pants: '#f5f5f5', shoe: '#ffffff' } },
+  carl: { name: 'Carl', col: '#a6e36b', sp: { skin: '#e2a97e', hair: '#6b4a2a', hs: 'short', shirt: '#5d6b30', pants: '#4d5a27', shoe: '#3b2a1a', hat: 'bucket', hatC: '#6f7d3c', stubble: 1 } },
+  al: { name: 'Al Czervik', col: '#e08bff', sp: { skin: '#e8b48a', hair: '#222222', hs: 'slick', shirt: '#7b3fa0', plaid: '#f0c419', pants: '#f0f0f0', shoe: '#222222', w: 9, cigar: 1, hat: 'cap', hatC: '#f0c419' } },
+  guard: { name: 'Lifeguard', col: '#ff7b7b', sp: { skin: '#d69565', hair: '#f0cf62', hs: 'short', shirt: '#d62828', pants: '#d62828', shorts: 1, shoe: '#d69565', whistle: 1, zinc: 1 } },
+  vendor: { name: 'Snack Bar Guy', col: '#dddddd', sp: { skin: '#e9b98f', hair: '#333333', hs: 'short', shirt: '#ffffff', pants: '#555555', shoe: '#222222', hat: 'paper', w: 8 } },
+  lacey: { name: 'Lacey Underall', col: '#ff9ecb', sp: { skin: '#f3caa0', hair: '#f7dd78', hs: 'long', shirt: '#ff6fa6', pants: '#f3caa0', dress: 1, shoe: '#ffffff' } },
+  spaulding: { name: 'Spaulding Smails', col: '#9ff0e0', sp: { skin: '#f3caa0', hair: '#7a4a1a', hs: 'short' } },
+  crowd: { name: 'Somebody in the pool', col: '#ff5555' },
+  motor: { name: 'Motormouth', col: '#ffd0a0' },
+};
+
+// Side-view person, facing right when face=1. (x, fy) is the point between the feet.
+function drawPerson(x, fy, sp, face = 1, walk = 0, o = {}) {
+  const u = o.u || 3;
+  ctx.save(); ctx.translate(Math.round(x), Math.round(fy)); if (face < 0) ctx.scale(-1, 1);
+  const P = (a, b, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(a * u, b * u, w * u, h * u); };
+  const L = sp.leg || 9, T = sp.torso || 10, tw = sp.w || 7, tx = -Math.floor(tw / 2);
+  const ph = walk > 0 ? Math.floor(walk * 8) % 4 : -1;
+  const lo = ph === 0 ? 1 : ph === 2 ? -1 : 0, as = -lo;
+  const skin = sp.skin, shoe = sp.shoe || skin, pants = sp.pants || '#555555';
+  const leg = (lx, c, sk) => {
+    if (sp.shorts) { P(lx, -L, 2, 3, c); P(lx, -L + 3, 2, L - 4, sk); }
+    else P(lx, -L, 2, L - 1, c);
+    P(lx, -1, 3, 1, shoe);
+  };
+  leg(-2 - lo, shade(pants, .78), shade(skin, .85));
+  leg(lo, pants, skin);
+  const sleeve = sp.shirt;
+  // back arm
+  P(-1 - as, -L - T + 1, 2, T - 3, shade(sleeve, .72)); P(-1 - as, -L - 2, 2, 2, shade(skin, .85));
+  // torso
+  P(tx, -L - T, tw, T, sp.shirt);
+  if (sp.pattern) for (let i = 0; i < tw * T; i++) if (hash2(i, 7) < .22) P(tx + i % tw, -L - T + (i / tw | 0), 1, 1, sp.pattern);
+  if (sp.plaid) { for (let yy = 1; yy < T; yy += 3) P(tx, -L - T + yy, tw, 1, sp.plaid); for (let xx = 1; xx < tw; xx += 3) P(tx + xx, -L - T, 1, T, shade(sp.plaid, .7)); }
+  if (sp.jacket) { P(tx + tw - 2, -L - T, 1, T - 1, '#ffffff'); P(tx + tw - 2, -L - T + 1, 1, 4, '#b8322a'); }
+  if (sp.bib) { P(tx + 1, -L - T + 2, tw - 2, 5, sp.bib); P(tx + 2, -L - T + 3, 1, 3, '#fff'); P(tx + 4, -L - T + 3, 1, 3, '#fff'); }
+  if (sp.dress) P(tx - 1, -L - 1, tw + 2, 4, sp.shirt);
+  else P(tx, -L - 1, tw, 1, shade(pants, .6));
+  if (sp.whistle) { P(tx + tw - 2, -L - T + 1, 1, 3, '#dddddd'); }
+  // front arm
+  if (o.reach) { P(0, -L - T + 2, 6, 2, shade(sleeve, 1.08)); P(6, -L - T + 2, 2, 2, skin); }
+  else { P(as, -L - T + 1, 2, T - 3, shade(sleeve, 1.08)); P(as, -L - 2, 2, 2, skin); }
+  // head
+  const hy = -L - T - 8;
+  P(-1, -L - T - 1, 3, 1, skin);
+  P(-3, hy, 7, 7, skin);
+  P(-1, hy + 3, 1, 2, shade(skin, .82));
+  const hc = sp.hair;
+  switch (sp.hs) {
+    case 'short': P(-3, hy - 1, 7, 2, hc); P(-3, hy + 1, 2, 3, hc); break;
+    case 'bald': P(-3, hy + 2, 2, 3, hc); P(-3, hy + 1, 1, 1, hc); break;
+    case 'curly': P(-4, hy - 2, 8, 3, hc); P(-4, hy + 1, 3, 3, hc); P(-3, hy - 3, 2, 1, hc); P(0, hy - 3, 2, 1, hc); break;
+    case 'feather': P(-3, hy - 2, 7, 3, hc); P(-4, hy, 3, 5, hc); P(2, hy - 1, 3, 2, hc); P(-2, hy - 3, 4, 1, shade(hc, 1.1)); break;
+    case 'long': P(-3, hy - 1, 7, 2, hc); P(-5, hy, 4, 12, hc); P(3, hy, 1, 3, hc); break;
+    case 'slick': P(-3, hy - 1, 7, 2, hc); P(-3, hy + 1, 2, 2, hc); break;
+  }
+  // face
+  if (o.blind) P(0, hy + 2, 5, 2, '#222222');
+  else P(2, hy + 3, 1, 1, '#1a1a1a');
+  P(4, hy + 3, 1, 2, skin);
+  if (sp.glasses) { P(1, hy + 2, 3, 1, '#222222'); P(1, hy + 3, 1, 1, '#222222'); P(3, hy + 3, 1, 1, '#222222'); }
+  const talking = o.talk && Math.floor(performance.now() / 110) % 2;
+  P(2, hy + 5, 2, talking ? 2 : 1, talking ? '#5a1a1a' : shade(skin, .7));
+  if (sp.stubble) P(0, hy + 5, 4, 2, 'rgba(60,40,20,.35)');
+  if (sp.cigar) { P(4, hy + 5, 3, 1, '#6b3e1f'); P(7, hy + 5, 1, 1, '#ff5522'); }
+  if (sp.tissue) P(4, hy + 4, 2, 1, '#ffffff');
+  if (sp.zinc) P(3, hy + 3, 2, 2, '#ffffff');
+  switch (sp.hat) {
+    case 'cap': P(-3, hy - 2, 7, 3, sp.hatC); P(3, hy, 3, 1, shade(sp.hatC, .8)); break;
+    case 'bucket': P(-3, hy - 3, 7, 3, sp.hatC); P(-5, hy, 11, 1, shade(sp.hatC, .85)); break;
+    case 'paper': P(-3, hy - 2, 7, 2, '#ffffff'); P(-3, hy - 1, 7, 1, '#d62828'); break;
+  }
+  ctx.restore();
+}
+
+// Kip or other golfer seen from above. Ball is at (0,0) in the rotated frame; aim is -y.
+function drawTopGolfer(bx, by, ang, sp, swing, flip) {
+  ctx.save(); ctx.translate(Math.round(bx), Math.round(by)); ctx.rotate(ang);
+  const gx = -11;
+  R(gx - 5, 3, 12, 4, 'rgba(0,0,0,.25)');
+  R(gx - 3, -6, 4, 3, sp.shoe || '#333'); R(gx - 3, 3, 4, 3, sp.shoe || '#333');
+  R(gx - 4, -5, 7, 10, sp.shirt); if (sp.bib) R(gx - 2, -3, 3, 6, sp.bib);
+  // club
+  const hx = gx + 4, hy = 0;
+  const a = swing;
+  const cx = hx + Math.cos(a) * 9, cy = hy + Math.sin(a) * 9;
+  ctx.strokeStyle = '#c8c8c8'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(cx, cy); ctx.stroke();
+  R(cx - 1.5, cy - 1.5, 3, 3, '#e8e8e8');
+  R(gx + 2, -2, 3, 4, sp.skin);
+  // head
+  R(gx - 3, -3, 6, 6, sp.skin); R(gx - 3, -3, 3, 6, sp.hat ? (sp.hatC || sp.hair) : sp.hair);
+  ctx.restore();
+}
+function drawTopPerson(x, y, sp, bob = 0) {
+  x = Math.round(x); y = Math.round(y + bob);
+  R(x - 5, y + 4, 11, 4, 'rgba(0,0,0,.25)');
+  R(x - 4, y - 3, 9, 8, sp.shirt);
+  R(x - 3, y - 7, 7, 6, sp.skin);
+  R(x - 3, y - 8, 7, 3, sp.hat ? sp.hatC : sp.hair);
+}
+
+// Gopher: side view (for scenes) and top-down pop-up (for challenge)
+function drawGopher(x, y, s = 3, dance = 0) {
+  const P = (a, b, w, h, c) => R(x + a * s, y + b * s, w * s, h * s, c);
+  const d = dance ? Math.round(Math.sin(performance.now() / 120)) : 0;
+  P(-4, -10 + d, 8, 10, '#8a5a2b'); P(-3, -9 + d, 6, 6, '#b07a45');
+  P(-3, -14 + d, 6, 5, '#8a5a2b'); P(-2, -13 + d, 1, 1, '#000'); P(1, -13 + d, 1, 1, '#000');
+  P(-1, -11 + d, 2, 1, '#3a2010'); P(-1, -10 + d, 1, 2, '#ffffff'); P(0, -10 + d, 1, 2, '#ffffff');
+  P(-4, -15 + d, 2, 2, '#6b4520'); P(2, -15 + d, 2, 2, '#6b4520');
+  const arm = dance ? (Math.floor(performance.now() / 160) % 2 ? -3 : 0) : 0;
+  P(-6, -8 + d + arm, 2, 3, '#8a5a2b'); P(4, -8 + d - arm, 2, 3, '#8a5a2b');
+}
+
+// ---------------- items ----------------
+const ITEMS = {
+  quarter: { name: 'Quarter', desc: 'A 1980 quarter. Fresh from the couch. Still slightly sticky.' },
+  keys: { name: 'Keys', desc: "Lou's key ring. Closet, office, and one labeled 'DO NOT'." },
+  bucket: { name: 'Bucket', desc: 'An empty mop bucket. Smells like 1974.' },
+  water: { name: 'Water', desc: 'A bucket full of hose water.' },
+  mop: { name: 'Mop', desc: 'A mop. It has seen things.' },
+  rake: { name: 'Rake', desc: "One of Carl's rakes. He says he has six." },
+  oil: { name: 'Oil Can', desc: 'A squirt can of oil. Label reads: "FOR MACHINES AND ALSO CARL".' },
+  candy: { name: 'Candy', desc: 'A chocolate candy bar with nuts. Brown. Log-shaped. Hmm.' },
+  hotdog: { name: 'Hot Dog', desc: 'A snack bar hot dog. Mustard only. Bushwood class.' },
+  hose: { name: 'Pump Hose', desc: 'The pool pump hose. Forty feet of blue.' },
+  retriever: { name: 'Retriever', desc: "Al Czervik's telescoping ball retriever. Extends twenty feet. Plays AM radio." },
+  baroo: { name: 'Billy B.', desc: "Billy Baroo, Judge Smails' beloved putter. Slightly damp." },
+};
+function drawItem(id, x, y) {
+  // 28x20 icon with top-left at x,y
+  const P = (a, b, w, h, c) => R(x + a, y + b, w, h, c);
+  switch (id) {
+    case 'quarter': P(8, 4, 12, 12, '#cfd3d6'); P(10, 6, 8, 8, '#aeb4b8'); P(12, 8, 3, 4, '#8a9094'); break;
+    case 'keys': P(5, 4, 8, 8, '#d4af37'); P(7, 6, 4, 4, '#222'); P(12, 8, 12, 3, '#d4af37'); P(20, 11, 2, 3, '#d4af37'); P(16, 11, 2, 2, '#d4af37'); break;
+    case 'bucket': P(6, 5, 16, 3, '#9aa0a6'); P(7, 8, 14, 10, '#7d848a'); P(9, 8, 2, 10, '#a9afb4'); break;
+    case 'water': P(6, 5, 16, 3, '#9aa0a6'); P(7, 6, 14, 3, '#4aa3ff'); P(7, 9, 14, 9, '#7d848a'); break;
+    case 'mop': P(13, 0, 2, 13, '#b98a4a'); P(8, 13, 12, 6, '#e8e2c8'); P(9, 16, 1, 3, '#bfb8a0'); P(13, 16, 1, 3, '#bfb8a0'); P(17, 16, 1, 3, '#bfb8a0'); break;
+    case 'rake': P(3, 9, 18, 2, '#b98a4a'); P(20, 4, 3, 12, '#777'); for (let i = 0; i < 4; i++) P(23, 4 + i * 3, 3, 1, '#777'); break;
+    case 'oil': P(6, 8, 12, 10, '#c0392b'); P(8, 10, 8, 3, '#f1c40f'); P(11, 4, 2, 4, '#999'); P(13, 2, 8, 2, '#999'); break;
+    case 'candy': P(3, 7, 22, 7, '#6b3e1f'); P(3, 8, 4, 5, '#e8e2c8'); P(21, 8, 4, 5, '#e8e2c8'); P(9, 9, 10, 3, '#d62828'); break;
+    case 'hotdog': P(3, 8, 22, 6, '#e6b06a'); P(5, 6, 18, 5, '#b5482a'); P(7, 8, 14, 1, '#f1d02b'); break;
+    case 'hose': ctx.strokeStyle = '#2e7bd6'; ctx.lineWidth = 2; for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.ellipse(x + 13, y + 10, 11 - i * 3.5, 8 - i * 2.5, 0, 0, 7); ctx.stroke(); } P(22, 14, 6, 3, '#999'); break;
+    case 'retriever': P(2, 12, 20, 2, '#c0c0c0'); P(2, 11, 6, 4, '#444'); P(22, 9, 5, 7, '#c0c0c0'); P(23, 10, 3, 5, '#333'); break;
+    case 'baroo': P(4, 2, 2, 14, '#c0c0c0'); P(3, 0, 4, 3, '#222'); P(4, 16, 12, 3, '#d4af37'); P(14, 15, 3, 4, '#b8962f'); break;
+  }
+}
+
+// Big title lettering
+function bigTitle(s, x, y, size, c1, c2) {
+  ctx.font = size + 'px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let i = 4; i > 0; i--) { ctx.fillStyle = i > 2 ? '#1a1a1a' : c2; ctx.fillText(s, x + i, y + i); }
+  ctx.fillStyle = c1; ctx.fillText(s, x, y);
+}
+
+// ============================================================
+//  GOLF: top-down holes, 3-click swing meter, ball physics
+//  Units are yards. x → right, y → down. Tee at the bottom.
+// ============================================================
+const CLUBS = [
+  { id: 'DR', name: 'Driver', carry: 235, loft: .10, roll: .15 },
+  { id: '3W', name: '3 Wood', carry: 212, loft: .12, roll: .12 },
+  { id: '5I', name: '5 Iron', carry: 180, loft: .16, roll: .09 },
+  { id: '7I', name: '7 Iron', carry: 152, loft: .21, roll: .07 },
+  { id: '9I', name: '9 Iron', carry: 126, loft: .26, roll: .05 },
+  { id: 'PW', name: 'P. Wedge', carry: 100, loft: .31, roll: .04 },
+  { id: 'SW', name: 'S. Wedge', carry: 72, loft: .38, roll: .02 },
+  { id: 'PT', name: 'Putter', putt: true },
+];
+const PUTT_MAX = 30, CUP_R = .6;
+const TER = {
+  rough: { name: 'Rough', lie: .82, dec: 30, err: 1.4, roll: .3, rgb: [52, 122, 48] },
+  fairway: { name: 'Fairway', lie: 1, dec: 14, err: 1, roll: 1, rgb: [96, 178, 72] },
+  green: { name: 'Green', lie: 1, dec: 5.5, err: 1, roll: .7, rgb: [112, 204, 96] },
+  fringe: { name: 'Fringe', lie: 1, dec: 9, err: 1, roll: .8, rgb: [92, 184, 80] },
+  tee: { name: 'Tee Box', lie: 1, dec: 14, err: 1, roll: 1, rgb: [100, 188, 78] },
+  sand: { name: 'Bunker', lie: .6, dec: 90, err: 1.6, roll: 0, rgb: [232, 212, 150] },
+  water: { name: 'Water', rgb: [52, 110, 196] },
+  ob: { name: 'Out of Bounds', rgb: [34, 80, 32] },
+  path: { name: 'Cart Path', lie: .95, dec: 6, err: 1.1, roll: 2.2, rgb: [190, 184, 168] },
+  floor: { name: 'Shed Floor', lie: .9, dec: 10, err: 1.2, roll: .6, rgb: [150, 112, 72] },
+  wall: { name: 'Wall', rgb: [90, 58, 32] },
+  dirt: { name: 'Dirt', lie: .85, dec: 22, err: 1.2, roll: .6, rgb: [128, 90, 54] },
+};
+const TLIST = Object.keys(TER), TIDX = {}; TLIST.forEach((k, i) => TIDX[k] = i);
+
+// shape constructors
+const E = (t, cx, cy, rx, ry, wob) => ({ k: 'e', t, cx, cy, rx, ry, wob });
+const RC = (t, x, y, w, h) => ({ k: 'r', t, x, y, w, h });
+const PT = (t, pts, r, wob) => ({ k: 'p', t, pts, r, wob });
+const GRN = (cx, cy, rx, ry) => [E('fringe', cx, cy, rx + 2.5, ry + 2.5, .3), E('green', cx, cy, rx, ry, .3)];
+const TEE = (x, y) => RC('tee', x - 6, y - 5, 12, 10);
+function segD(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy;
+  const t = l ? clamp(((px - ax) * dx + (py - ay) * dy) / l, 0, 1) : 0;
+  return Math.hypot(px - ax - dx * t, py - ay - dy * t);
+}
+function inShape(s, x, y) {
+  const wob = (Math.sin(x * .23 + y * .11) + Math.sin(y * .31 - x * .07)) * (s.wob ?? .8);
+  switch (s.k) {
+    case 'e': { const dx = (x - s.cx) / (s.rx + wob), dy = (y - s.cy) / (s.ry + wob); return dx * dx + dy * dy <= 1; }
+    case 'r': return x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h;
+    case 'p': for (let i = 0; i < s.pts.length - 1; i++) if (segD(x, y, s.pts[i][0], s.pts[i][1], s.pts[i + 1][0], s.pts[i + 1][1]) <= s.r + wob) return true; return false;
+  }
+  return false;
+}
+function rawTerrain(def, x, y) {
+  let t = def.base || 'rough';
+  for (const s of def.shapes) if (inShape(s, x, y)) t = s.t;
+  return t;
+}
+function terrColor(t, x, y) {
+  const h = hash2(x, y); let c = TER[t].rgb;
+  switch (t) {
+    case 'rough': c = h < .15 ? [44, 108, 40] : h > .92 ? [64, 138, 56] : c; break;
+    case 'fairway': c = (Math.floor((x + y) / 9) % 2) ? [88, 166, 66] : c; break;
+    case 'green': c = ((x >> 1) + (y >> 1)) % 2 ? [106, 196, 91] : c; break;
+    case 'tee': c = (y % 4 < 2) ? [94, 178, 72] : c; break;
+    case 'sand': c = h < .1 ? [212, 190, 128] : c; break;
+    case 'water': c = h < .04 ? [96, 150, 222] : (y % 7 === 0 && h < .5) ? [62, 124, 208] : c; break;
+    case 'ob': c = (x + y) % 6 === 0 ? [28, 68, 27] : c; break;
+    case 'floor': c = y % 5 === 0 ? [110, 80, 50] : (x + (y / 5 | 0) * 7) % 13 === 0 ? [120, 88, 56] : c; break;
+    case 'wall': c = (x + y) % 3 === 0 ? [70, 44, 24] : c; break;
+    case 'dirt': c = h < .3 ? [108, 76, 44] : c; break;
+    case 'path': c = h < .1 ? [170, 164, 150] : c; break;
+  }
+  return c;
+}
+const HOLE_CACHE = {};
+function buildHole(id) {
+  if (HOLE_CACHE[id]) return HOLE_CACHE[id];
+  const def = HOLES[id], w = def.w, h = def.h;
+  const cvs = document.createElement('canvas'); cvs.width = w; cvs.height = h;
+  const c = cvs.getContext('2d'); const img = c.createImageData(w, h); const d = img.data;
+  const grid = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const t = rawTerrain(def, x + .5, y + .5), i = y * w + x;
+    grid[i] = TIDX[t];
+    const col = terrColor(t, x, y);
+    d[i * 4] = col[0]; d[i * 4 + 1] = col[1]; d[i * 4 + 2] = col[2]; d[i * 4 + 3] = 255;
+  }
+  // bake trees: shadows first, then canopies
+  const trees = def.trees || [];
+  for (const [tx, ty, r] of trees) {
+    for (let y = Math.floor(ty - r); y <= ty + r + 5; y++) for (let x = Math.floor(tx - r); x <= tx + r + 5; x++) {
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      if (dist(x, y, tx + r * .35, ty + r * .45) < r) { const i = (y * w + x) * 4; d[i] *= .62; d[i + 1] *= .62; d[i + 2] *= .62; }
+    }
+  }
+  for (const [tx, ty, r] of trees) {
+    for (let y = Math.floor(ty - r); y <= ty + r; y++) for (let x = Math.floor(tx - r); x <= tx + r; x++) {
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      const dd = dist(x + .5, y + .5, tx, ty); if (dd > r) continue;
+      const hh = hash2(x * 3, y * 5);
+      let col = [34, 104, 44];
+      if (dist(x, y, tx - r * .35, ty - r * .35) < r * .5) col = [62, 142, 62];
+      else if (dd > r * .78) col = [22, 76, 32];
+      if (hh < .12) col = [26, 84, 36]; else if (hh > .94) col = [80, 160, 76];
+      const i = (y * w + x) * 4; d[i] = col[0]; d[i + 1] = col[1]; d[i + 2] = col[2];
+    }
+  }
+  c.putImageData(img, 0, 0);
+  const sparkles = [];
+  for (let k = 0; k < 4000 && sparkles.length < 120; k++) {
+    const x = Math.random() * w | 0, y = Math.random() * h | 0;
+    if (grid[y * w + x] === TIDX.water) sparkles.push([x, y, Math.random() * 6]);
+  }
+  return HOLE_CACHE[id] = { def, w, h, cvs, grid, sparkles };
+}
+
+// ---------------- hole definitions ----------------
+const HOLES = {
+  judge: {
+    num: 9, name: "Judge's Loop", par: 4, w: 200, h: 400, tee: [100, 378], pin: [112, 42], comp: 'smails', maxWind: 8, slope: [.25, .1],
+    shapes: [RC('ob', 0, 0, 14, 400), RC('ob', 186, 0, 14, 400),
+      PT('fairway', [[100, 360], [98, 260], [104, 160], [110, 80]], 23), ...GRN(112, 42, 17, 13),
+      E('sand', 84, 58, 8, 6), E('sand', 140, 48, 7, 9), E('sand', 132, 200, 9, 7), E('sand', 70, 230, 7, 6), TEE(100, 378)],
+    trees: [[45, 330, 9], [40, 280, 10], [50, 200, 9], [38, 140, 11], [55, 90, 8], [160, 320, 10], [165, 250, 9], [158, 170, 11], [165, 100, 9], [150, 20, 10], [70, 18, 9]],
+    lay: [[100, 150], [104, 120], [105, 200]],
+  },
+  czervik: {
+    num: 14, name: 'The Lake Hole', par: 3, w: 170, h: 230, tee: [84, 208], pin: [88, 44], comp: 'al', maxWind: 9, slope: [-.3, 0],
+    shapes: [RC('ob', 0, 0, 12, 230), RC('ob', 158, 0, 12, 230), E('water', 84, 118, 58, 40, 2), ...GRN(88, 44, 16, 12),
+      E('sand', 64, 36, 7, 6), E('sand', 110, 60, 7, 5), TEE(84, 208), PT('fairway', [[84, 190], [84, 168]], 10)],
+    trees: [[30, 190, 9], [140, 185, 9], [25, 60, 10], [148, 40, 9], [35, 20, 8]],
+  },
+  shed: {
+    num: '-', name: 'Playing Through', par: 2, w: 70, h: 100, tee: [34, 88], pin: [34, 18], comp: 'ty', mode: 'shed', zoom: 3.4, maxWind: 0,
+    clubs: ['9I', 'PW', 'SW', 'PT'],
+    shapes: [...GRN(34, 18, 10, 8), RC('floor', 10, 50, 50, 46),
+      RC('wall', 8, 48, 22, 2), RC('wall', 38, 48, 24, 2), RC('wall', 8, 48, 2, 50), RC('wall', 60, 48, 2, 50), RC('wall', 8, 96, 54, 2),
+      RC('wall', 12, 56, 12, 6), RC('wall', 46, 60, 10, 9), RC('wall', 14, 74, 6, 5), RC('dirt', 26, 82, 16, 10)],
+    trees: [[6, 12, 6], [64, 22, 7], [58, 4, 5]],
+  },
+  gopher: {
+    num: '-', name: "Carl's Gopher Hunt", par: 0, w: 130, h: 130, tee: [65, 122], pin: [-99, -99], comp: 'carl', mode: 'gopher', zoom: 2.6, maxWind: 4,
+    clubs: ['9I', 'PW', 'SW'], base: 'fairway',
+    shapes: [RC('ob', 0, 0, 6, 130), RC('ob', 124, 0, 6, 130), RC('ob', 0, 0, 130, 6), E('rough', 20, 30, 16, 20), E('rough', 110, 50, 14, 22), TEE(65, 122)],
+    trees: [[16, 110, 7], [114, 112, 8], [100, 14, 7]],
+    gholes: [[42, 72], [86, 64], [64, 40], [30, 34], [96, 96], [58, 84], [104, 30]],
+  },
+  blind: {
+    num: '-', name: 'Be the Ball', par: 0, w: 50, h: 50, tee: [25, 30], pin: [25, 14], comp: 'ty', mode: 'blind', zoom: 6, maxWind: 0, base: 'rough',
+    shapes: [...GRN(25, 22, 21, 19)],
+    putts: [{ b: [25, 23], s: [.7, 0] }, { b: [17, 25], s: [.5, .5] }, { b: [34, 28], s: [-.8, .3] }],
+  },
+  t1: {
+    num: 1, name: 'The Opener', par: 4, w: 210, h: 420, tee: [105, 400], pin: [96, 34], comp: 'lou', maxWind: 8,  slope: [.3, 0],
+    shapes: [RC('ob', 0, 0, 12, 420), RC('ob', 198, 0, 12, 420),
+      PT('fairway', [[105, 385], [108, 280], [100, 170], [96, 70]], 24), ...GRN(96, 34, 17, 14),
+      E('sand', 128, 205, 9, 8), E('sand', 76, 150, 8, 7), E('sand', 74, 40, 6, 8), E('sand', 120, 24, 8, 6), TEE(105, 400)],
+    trees: [[50, 360, 10], [45, 290, 9], [55, 230, 11], [40, 170, 9], [50, 100, 10], [160, 350, 9], [168, 280, 11], [155, 210, 8], [165, 140, 10], [155, 70, 9], [140, 15, 8], [50, 20, 9]],
+    lay: [[106, 170], [102, 150]],
+  },
+  t2: {
+    num: 7, name: "Billy Baroo's Revenge", par: 3, w: 170, h: 230, tee: [85, 212], pin: [92, 40], comp: 'lou', maxWind: 9, slope: [-.4, .2],
+    shapes: [RC('ob', 0, 0, 12, 230), RC('ob', 158, 0, 12, 230), E('water', 104, 100, 44, 30, 2), PT('water', [[140, 100], [165, 70]], 6),
+      PT('fairway', [[85, 196], [80, 150], [84, 80]], 14), ...GRN(92, 40, 15, 12), E('sand', 116, 50, 7, 7), E('sand', 70, 28, 6, 5), TEE(85, 212)],
+    trees: [[30, 200, 9], [25, 140, 10], [30, 70, 9], [145, 190, 9], [150, 20, 9]],
+  },
+  t3: {
+    num: 12, name: 'Gopher Alley', par: 5, w: 260, h: 520, tee: [190, 500], pin: [70, 42], comp: 'lou', maxWind: 8, slope: [.3, .3],
+    shapes: [RC('ob', 0, 0, 10, 520), RC('ob', 250, 0, 10, 520),
+      PT('fairway', [[190, 488], [186, 330], [160, 240], [110, 170], [80, 110], [72, 70]], 25),
+      PT('water', [[10, 222], [120, 212], [260, 196]], 5, 1), ...GRN(70, 42, 16, 13),
+      E('sand', 222, 300, 9, 12), E('sand', 130, 140, 9, 7), E('sand', 48, 60, 6, 7), E('sand', 94, 30, 6, 5),
+      E('dirt', 230, 400, 3, 3, .2), E('dirt', 40, 300, 3, 3, .2), E('dirt', 150, 90, 3, 3, .2), TEE(190, 500)],
+    trees: [[120, 300, 11], [100, 330, 10], [130, 265, 9], [90, 270, 10], [70, 240, 11], [60, 330, 9], [235, 450, 9], [240, 380, 10], [235, 230, 10], [200, 150, 11], [180, 90, 9], [30, 150, 10], [25, 90, 9], [130, 30, 10]],
+    lay: [[186, 270], [172, 250], [110, 140], [96, 130]],
+  },
+  t4: {
+    num: 16, name: "Dr. Beeper's Dogleg", par: 4, w: 240, h: 420, tee: [60, 400], pin: [192, 46], comp: 'lou', maxWind: 8, slope: [-.35, 0],
+    shapes: [RC('ob', 0, 0, 10, 420), RC('ob', 230, 0, 10, 420), RC('ob', 0, 0, 240, 8),
+      PT('fairway', [[60, 388], [62, 270], [80, 190], [130, 130], [180, 80]], 25), ...GRN(192, 46, 16, 13),
+      E('sand', 110, 205, 10, 8), E('sand', 40, 170, 7, 9), E('sand', 170, 70, 6, 5), E('sand', 214, 40, 6, 7), TEE(60, 400)],
+    trees: [[120, 300, 11], [140, 260, 12], [160, 220, 11], [185, 180, 10], [210, 150, 9], [120, 350, 10], [180, 300, 12], [200, 250, 10], [25, 330, 9], [20, 250, 10], [30, 100, 11], [70, 60, 10], [110, 40, 9]],
+    lay: [[66, 180], [70, 170], [72, 200]],
+  },
+  t5: {
+    num: 18, name: "The Bishop's Storm", par: 4, w: 220, h: 440, tee: [110, 420], pin: [112, 36], comp: 'lou', storm: true, wind: [11, Math.PI * .5], slope: [.5, -.2],
+    shapes: [RC('ob', 208, 0, 12, 440), E('water', 36, 200, 38, 150, 2),
+      PT('fairway', [[110, 405], [118, 260], [110, 130], [112, 60]], 25), ...GRN(112, 36, 17, 13),
+      E('sand', 140, 30, 7, 9), E('sand', 90, 60, 7, 5), E('sand', 150, 170, 9, 7), TEE(110, 420)],
+    trees: [[170, 380, 10], [180, 300, 9], [175, 230, 11], [185, 150, 10], [170, 80, 9], [60, 410, 8], [50, 30, 10], [170, 15, 8]],
+    lay: [[112, 185], [116, 200]],
+  },
+};
+const TOURNEY = ['t1', 't2', 't3', 't4', 't5'];
+
+const QUIPS = {
+  smails: { good: ['Adequate. I shall take full credit.', 'A fine shot. By me, technically.', 'Splendid. Remember, I hit that.'],
+    bad: ['Boy, I am not paying you to hit it there.', 'Hmm. That will cost you on the tip.', 'I have sentenced men for less.'],
+    water: ['Into the drink. Like my third martini.'], sand: ['A bunker. How very common.'], ob: ['Out of bounds! Like caddies at the pool.'],
+    holed: ['Hmph. Well struck, I suppose.'] },
+  ty: { good: ['Nice.', 'See your future. Be your future.', 'Now that was Zen.'],
+    bad: ["Don't think. Feel. Maybe feel less.", 'Hm. Interesting choice.', "That's okay. Nobody's watching. Except me."],
+    water: ['Water. Also very Zen.'], sand: ['Sand is just very small rocks. Relax.'], ob: ['Out. Let it go.'],
+    wall: ['That was the wall. The wall is not the window.'], holed: ['Nice.'] },
+  carl: { good: ['Whoa! Almost had the varmint!', 'Heh heh. Nice.'],
+    bad: ["He's laughin' at us, kid.", 'I seen him wink. He winked at me.'],
+    bonk: ['GOT YA! Oh, that had to hurt. Heh heh heh.', "Right in the kisser! That's for the 14th green!", 'BONK! Thirty-two bonks to go. Heh.'],
+    water: ['Splash.'], sand: ['Sand trap. I raked that this morning.'], ob: ['Over the fence!'], holed: ['In the hole!'] },
+  al: { good: ['Hey! This kid can PLAY!', "Oooh, look at that! Somebody call Arnie!", "Now THAT's a shot!"],
+    bad: ["Oh, that's no good. Nobody saw that. Let's pretend.", "Whoa, it's a slice! Like pizza!", 'Hey, you break it, you buy it!'],
+    water: ['Ha! Fish gotta eat too!'], sand: ['A beach! Somebody get me a mai tai!'], ob: ["That ball's goin' to Jersey!"],
+    holed: ['HE DID IT! Drinks on me! Well, on the Judge!'] },
+  lou: { good: ['Nice poke, Kowalski!', "Now you're lookin' good, kid.", 'Beauty!'],
+    bad: ['Ooh. I had money on you, kid.', 'That one had some English on it. Bad English.', "Hey, it happens. Don't let it happen again."],
+    water: ["Water! That's a stroke, kid."], sand: ['Beach party.'], ob: ["Out of bounds! Re-tee, kid."], holed: ['In the cup!'] },
+};
+
+// ---------------- golf scene ----------------
+const Golf = {
+  start(id, opts = {}) {
+    return new Promise(res => {
+      const def = HOLES[id];
+      Object.assign(this, { id, def, hole: buildHole(id), opts, res, mode: def.mode || 'stroke', strokes: 0, state: 'pre', t: 0,
+        ball: { x: def.tee[0], y: def.tee[1], z: 0 }, pin: { x: def.pin[0], y: def.pin[1] }, v: { x: 0, y: 0 },
+        msg: null, bubble: null, dark: false, shot: null, golfer: { x: def.tee[0], y: def.tee[1] }, swingA: .2, swingAnim: 0,
+        lastSafe: { x: def.tee[0], y: def.tee[1] }, scout: false, flash: 0, lipped: false, landing: false, result: null, rain: [] });
+      const wd = def.wind || [Math.round(rnd(0, def.maxWind ?? 8)), rnd(0, Math.PI * 2)];
+      this.windMph = wd[0]; this.windA = wd[1];
+      this.slope = { x: 0, y: 0 };
+      this.cam = { x: this.pin.x, y: this.pin.y, z: def.zoom || 2 };
+      if (this.mode === 'gopher') { this.bonks = 0; this.balls = 8; this.gi = 0; this.gst = 'up'; this.gt = 0; this.moveGopher(); }
+      if (this.mode === 'blind') { this.pi = 0; this.goods = 0; this.setupPutt(); }
+      if (def.storm) for (let i = 0; i < 90; i++) this.rain.push([Math.random() * W, Math.random() * H, rnd(300, 500)]);
+      setScene(this);
+      playSong(opts.song || 'golf');
+      const go = async () => {
+        if (opts.pre) await opts.pre();
+        this.state = 'intro'; this.t = 0;
+        if (this.mode === 'blind') { this.state = 'peek'; this.t = 0; }
+      };
+      go();
+    });
+  },
+  // ---------- helpers ----------
+  terr(x, y) {
+    const h = this.hole; if (x < 0 || y < 0 || x >= h.w || y >= h.h) return 'ob';
+    return TLIST[h.grid[(y | 0) * h.w + (x | 0)]];
+  },
+  treeAt(x, y) { for (const [tx, ty, r] of (this.def.trees || [])) if (dist(x, y, tx, ty) < r * .85) return true; return false; },
+  clubs() { const ids = this.def.clubs; return ids ? CLUBS.filter(c => ids.includes(c.id)) : CLUBS; },
+  club() { return this.clubs()[this.ci]; },
+  target() { return this.mode === 'gopher' ? { x: this.def.gholes[this.gi][0], y: this.def.gholes[this.gi][1] } : this.pin; },
+  lieFactor(cl) { const t = this.lie; if (t === 'sand' && cl.id === 'SW') return .95; return (TER[t] && TER[t].lie) || 1; },
+  onPuttSurface() { return this.lie === 'green' || (this.lie === 'fringe' && dist(this.ball.x, this.ball.y, this.pin.x, this.pin.y) < 25); },
+  setupPutt() {
+    const p = this.def.putts[this.pi];
+    this.ball = { x: p.b[0], y: p.b[1], z: 0 }; this.slope = { x: p.s[0], y: p.s[1] };
+    this.golfer = { x: p.b[0], y: p.b[1] };
+  },
+  moveGopher() {
+    let n; do { n = Math.floor(Math.random() * this.def.gholes.length); } while (n === this.gi && this.def.gholes.length > 1);
+    this.gi = n; this.gst = 'up'; this.gt = 0;
+  },
+  newShot() {
+    const b = this.ball; this.lie = this.terr(b.x, b.y); this.lipped = false; this.landing = false;
+    if (this.def.slope) this.slope = { x: this.def.slope[0], y: this.def.slope[1] };
+    const tg = this.target(); const d = dist(b.x, b.y, tg.x, tg.y);
+    const cl = this.clubs();
+    if (this.mode === 'blind' || (this.onPuttSurface() && cl.some(c => c.putt))) this.ci = cl.findIndex(c => c.putt);
+    else {
+      let pickI = 0;
+      for (let i = cl.length - 1; i >= 0; i--) { if (cl[i].putt) continue; if (cl[i].carry * this.lieFactor(cl[i]) >= d * .93) { pickI = i; break; } }
+      if (this.lie !== 'tee' && cl[pickI].id === 'DR' && cl[1]) pickI = 1;
+      this.ci = pickI;
+    }
+    // auto aim: at the pin if reachable, otherwise at the best lay-up spot
+    let aimPt = tg;
+    const c = this.club();
+    if (!c.putt && this.def.lay && d > c.carry * this.lieFactor(c) * 1.08) {
+      let best = null, bs = 1e9;
+      for (const p of this.def.lay) {
+        if (dist(p[0], p[1], tg.x, tg.y) > d - 15) continue;
+        const s = Math.abs(dist(b.x, b.y, p[0], p[1]) - c.carry * this.lieFactor(c));
+        if (s < bs) { bs = s; best = p; }
+      }
+      if (best) aimPt = { x: best[0], y: best[1] };
+    }
+    this.aim = Math.atan2(aimPt.x - b.x, -(aimPt.y - b.y));
+    this.golfer = { x: b.x, y: b.y };
+    this.state = 'aim'; this.m = null; this.swingA = .2; this.aimHeld = 0;
+  },
+  quip(ev) {
+    const q = QUIPS[this.def.comp]; if (!q) return;
+    const list = q[ev] || q[ev === 'holed' ? 'good' : 'bad']; if (!list) return;
+    this.bubble = { who: this.def.comp, text: pick(list), t: 2.6 };
+  },
+  setMsg(t, col = '#fff', time = 1.4) { this.msg = { t, col, time }; },
+  // ---------- update ----------
+  update(dt, blocked) {
+    this.t += dt;
+    if (this.bubble && (this.bubble.t -= dt) <= 0) this.bubble = null;
+    if (this.msg && (this.msg.time -= dt) <= 0 && this.state !== 'result') this.msg = null;
+    if (this.flash > 0) this.flash -= dt;
+    if (this.def.storm) { if (Math.random() < dt * .12) { this.flash = .25; SFX.thunder(); } for (const r of this.rain) { r[1] += r[2] * dt; r[0] -= r[2] * dt * .3; if (r[1] > H) { r[1] = -10; r[0] = Math.random() * W * 1.3; } } }
+    if (this.mode === 'gopher') this.gt += dt;
+    const z0 = this.def.zoom || 2;
+    let tz = z0, tx = this.ball.x, ty = this.ball.y;
+    switch (this.state) {
+      case 'pre': tx = this.pin.x; ty = this.pin.y; break;
+      case 'intro': {
+        const k = clamp(this.t / 2.2, 0, 1), e = k * k * (3 - 2 * k);
+        tx = lerp(this.pin.x, this.def.tee[0], e); ty = lerp(this.pin.y, this.def.tee[1], e);
+        this.cam.x = tx; this.cam.y = ty;
+        if (!blocked && (hit('a') || hit('b')) || this.t > 2.6) this.newShot();
+        break;
+      }
+      case 'peek':
+        this.dark = false; tz = z0; tx = (this.ball.x + this.pin.x) / 2; ty = (this.ball.y + this.pin.y) / 2;
+        if (this.t > 2.8 && !blocked) { this.newShot(); this.dark = true; }
+        break;
+      case 'aim': case 'meter': {
+        const c = this.club();
+        if (!c) { this.newShot(); break; }
+        const putting = c.putt;
+        if (putting) tz = Math.max(z0, this.def.puttZoom || 5);
+        const rp = this.reticle();
+        tx = (this.ball.x + rp.x) / 2; ty = (this.ball.y + rp.y) / 2;
+        if (this.scout) { tx = this.cam.x; ty = this.cam.y; tz = Math.min(z0, 1.3); }
+        if (!blocked) this.state === 'aim' ? this.updAim(dt) : this.updMeter(dt);
+        break;
+      }
+      case 'flight': this.updFlight(dt); tx = this.ball.x; ty = this.ball.y; break;
+      case 'roll': this.updRoll(dt); tx = this.ball.x; ty = this.ball.y; if (this.club().putt) tz = Math.max(z0, this.def.puttZoom || 5); break;
+      case 'result':
+        this.rt -= dt; if (this.club() && this.club().putt) tz = Math.max(z0, this.def.puttZoom || 5);
+        if (this.rt <= 0 || (!blocked && hit('a') && this.rt < 1)) this.afterResult();
+        break;
+      case 'holed':
+        this.rt -= dt; tz = Math.max(z0, 3);
+        if (this.rt <= 0 || (!blocked && hit('a') && this.rt < 2)) this.finish({ strokes: this.strokes, holed: true });
+        break;
+    }
+    if (this.state !== 'intro') {
+      const k = Math.min(1, dt * (this.state === 'flight' ? 6 : 4));
+      this.cam.x = lerp(this.cam.x, tx, k); this.cam.y = lerp(this.cam.y, ty, k);
+    }
+    this.cam.z = lerp(this.cam.z, tz, Math.min(1, dt * 4));
+    // keep camera within hole
+    const hw = W / 2 / this.cam.z, hh = H / 2 / this.cam.z;
+    this.cam.x = this.hole.w > hw * 2 ? clamp(this.cam.x, hw, this.hole.w - hw) : this.hole.w / 2;
+    this.cam.y = this.hole.h > hh * 2 - 40 / this.cam.z ? clamp(this.cam.y, hh - 24 / this.cam.z, this.hole.h - hh + 40 / this.cam.z) : this.hole.h / 2;
+  },
+  reticle() {
+    const c = this.club(), b = this.ball;
+    let d;
+    if (c.putt) { const tg = this.target(); d = Math.max(2, dist(b.x, b.y, tg.x, tg.y)); }
+    else d = c.carry * this.lieFactor(c);
+    return { x: b.x + Math.sin(this.aim) * d, y: b.y - Math.cos(this.aim) * d };
+  },
+  updAim(dt) {
+    if (this.scout) {
+      const sp = 160 * dt;
+      if (isDown('left')) this.cam.x -= sp; if (isDown('right')) this.cam.x += sp;
+      if (isDown('up')) this.cam.y -= sp; if (isDown('down')) this.cam.y += sp;
+      if (hit('x') || hit('b') || hit('a')) { this.scout = false; SFX.move(); }
+      return;
+    }
+    const putting = this.club().putt;
+    const l = isDown('left'), r = isDown('right');
+    if (l || r) {
+      this.aimHeld += dt;
+      const base = putting ? .05 : .09, max = putting ? .45 : .8;
+      const rate = Math.min(max, base + this.aimHeld * this.aimHeld * (putting ? .5 : 1.4));
+      this.aim += (r ? 1 : -1) * rate * dt;
+    } else this.aimHeld = 0;
+    if (rep('lb')) this.aim -= .004; if (rep('rb')) this.aim += .004;
+    const cl = this.clubs();
+    if (rep('up')) { let i = this.ci; do { i = (i + cl.length - 1) % cl.length; } while (cl[i].putt && !this.onPuttSurface() && cl.length > 1 && i !== this.ci); this.ci = i; SFX.move(); }
+    if (rep('down')) { let i = this.ci; do { i = (i + 1) % cl.length; } while (cl[i].putt && !this.onPuttSurface() && cl.length > 1 && i !== this.ci); this.ci = i; SFX.move(); }
+    if (hit('x')) { this.scout = true; SFX.move(); }
+    if (hit('a')) { this.state = 'meter'; this.m = { ph: 'up', v: 0, p: 0 }; SFX.blip(); }
+  },
+  updMeter(dt) {
+    const m = this.m, spd = this.club().putt ? .8 : 1.05;
+    if (hit('b') && m.ph !== 'acc') { this.state = 'aim'; this.swingA = .2; SFX.no(); return; }
+    if (m.ph === 'up') { m.v += dt * spd; if (m.v >= 1) { m.v = 1; m.ph = 'down'; } if (hit('a')) { m.p = m.v; m.ph = 'acc'; SFX.blip(); } }
+    else if (m.ph === 'down') { m.v -= dt * spd; if (hit('a')) { m.p = m.v; m.ph = 'acc'; SFX.blip(); } else if (m.v <= 0) { this.state = 'aim'; this.swingA = .2; this.setMsg('Swing cancelled', '#ccc', 1); return; } }
+    else { m.v -= dt * 1.2; if (hit('a')) return this.fire(m.p, m.v); if (m.v < -.22) return this.fire(m.p, -.22); }
+    if (m.ph !== 'acc') this.swingA = .2 + m.v * 2.6;
+  },
+  fire(power, acc) {
+    const off = acc; let e = Math.abs(off) < .025 ? 0 : clamp(off / .1, -2.2, 2.2);
+    const cl = this.club(), b = this.ball, lieT = this.lie, err = (TER[lieT] && TER[lieT].err) || 1;
+    this.strokes++; this.lastSafe = { x: b.x, y: b.y }; this.swingAnim = .35;
+    if (e === 0) this.setMsg(cl.putt ? 'Pure stroke' : 'PERFECT!', '#9dff8a', 1);
+    else if (Math.abs(e) > 1.5) this.setMsg(e > 0 ? 'Big hook!' : 'Shanked it!', '#ff8a8a', 1.2);
+    else if (!cl.putt && Math.abs(e) > .5) this.setMsg(e > 0 ? 'Hook' : 'Slice', '#ffd28a', 1);
+    if (cl.putt) {
+      const dir = this.aim - e * .035;
+      const v0 = Math.sqrt(2 * TER.green.dec * PUTT_MAX * Math.max(.02, power));
+      this.v = { x: Math.sin(dir) * v0, y: -Math.cos(dir) * v0 };
+      this.state = 'roll'; SFX.putt(); return;
+    }
+    const lie = this.lieFactor(cl);
+    const D = cl.carry * power * lie;
+    const ang = this.aim - e * .02 * err;
+    const C = -e * D * .1 * err;
+    let Hh = D * cl.loft + 2;
+    if (lieT === 'floor' || (this.mode === 'shed' && b.y > 50)) Hh = Math.min(Hh, 2.6);
+    const T = .8 + D / 110;
+    const wv = this.windMph * .22 * (.6 + cl.loft * 2);
+    const wx = Math.sin(this.windA) * wv * T, wy = -Math.cos(this.windA) * wv * T;
+    this.shot = { sx: b.x, sy: b.y, fx: Math.sin(ang), fy: -Math.cos(ang), rx: Math.cos(ang), ry: Math.sin(ang), D, C, H: Hh, T, t: 0, wx, wy, cl };
+    this.state = 'flight'; SFX.hit(); if (lieT === 'sand') SFX.sand();
+  },
+  shotPos(t) {
+    const s = this.shot;
+    return { x: s.sx + s.fx * s.D * t + s.rx * s.C * t * t + s.wx * t * t, y: s.sy + s.fy * s.D * t + s.ry * s.C * t * t + s.wy * t * t, z: 4 * s.H * t * (1 - t) };
+  },
+  updFlight(dt) {
+    const s = this.shot; const prev = { x: this.ball.x, y: this.ball.y };
+    s.t = Math.min(1, s.t + dt / s.T);
+    const p = this.shotPos(s.t); this.ball.x = p.x; this.ball.y = p.y; this.ball.z = p.z;
+    const t = this.terr(p.x, p.y);
+    if (t === 'wall' && p.z < 6) { SFX.thwack(); this.ball.x = prev.x; this.ball.y = prev.y; this.ball.z = 0; this.v = { x: -s.fx * 4, y: -s.fy * 4 }; this.state = 'roll'; this.setMsg('CLANG!', '#ffb0b0'); this.quip('wall'); return; }
+    if (p.z < 12 && s.t > .08 && this.treeAt(p.x, p.y)) { SFX.thwack(); this.ball.z = 0; this.v = { x: -s.fx * 3 + rnd(-2, 2), y: -s.fy * 3 + rnd(-2, 2) }; this.state = 'roll'; this.setMsg('Thwack! Hit a tree', '#ffd28a'); this.quip('bad'); return; }
+    if (this.mode === 'gopher' && s.t >= 1 && this.gopherCheck(3)) return;
+    if (s.t >= 1) {
+      this.ball.z = 0;
+      if (t === 'water') return this.penalty('water');
+      if (t === 'ob') return this.penalty('ob');
+      if (this.mode !== 'gopher' && dist(p.x, p.y, this.pin.x, this.pin.y) < .9) return this.holed(true);
+      if (t === 'sand') SFX.sand(); else SFX.land();
+      const d2x = s.fx * s.D + s.rx * 2 * s.C + 2 * s.wx, d2y = s.fy * s.D + s.ry * 2 * s.C + 2 * s.wy, n = Math.hypot(d2x, d2y) || 1;
+      const Rr = s.D * s.cl.roll * ((TER[t] && TER[t].roll) ?? .5);
+      const dec = Math.max((TER[t] && TER[t].dec) || 14, 12);
+      const v0 = Math.sqrt(2 * dec * Rr);
+      this.v = { x: d2x / n * v0, y: d2y / n * v0 }; this.landing = true; this.state = 'roll';
+    }
+  },
+  gopherCheck(r) {
+    if (this.gst !== 'up') return false;
+    const g = this.def.gholes[this.gi];
+    if (dist(this.ball.x, this.ball.y, g[0], g[1]) < r) {
+      this.bonks++; this.gst = 'dizzy'; this.gt = 0; SFX.bonk(); this.setMsg('BONK!', '#ffe066', 1.4); this.quip('bonk');
+      this.ball.z = 0; this.v = { x: 0, y: 0 }; this.resolve(true); return true;
+    }
+    return false;
+  },
+  updRoll(dt) {
+    const steps = 4, sdt = dt / steps, b = this.ball;
+    for (let k = 0; k < steps; k++) {
+      const t = this.terr(b.x, b.y);
+      if (t === 'water') return this.penalty('water');
+      if (t === 'ob') return this.penalty('ob');
+      let dec = (TER[t] && TER[t].dec) || 20;
+      if (this.landing && (t === 'green' || t === 'fringe')) dec = Math.max(dec, 12);
+      if (t === 'green') { this.v.x += this.slope.x * sdt; this.v.y += this.slope.y * sdt; }
+      let sp = Math.hypot(this.v.x, this.v.y);
+      if (sp > 0) { const ns = Math.max(0, sp - dec * sdt); this.v.x *= ns / sp; this.v.y *= ns / sp; sp = ns; }
+      if (this.mode !== 'gopher') {
+        const dp = dist(b.x, b.y, this.pin.x, this.pin.y);
+        if (dp < CUP_R) {
+          if (sp < 7.5) return this.holed(false);
+          if (!this.lipped) { this.lipped = true; SFX.lip(); const a = rnd(.5, .9) * (Math.random() < .5 ? -1 : 1), c = Math.cos(a), s = Math.sin(a); this.v = { x: (this.v.x * c - this.v.y * s) * .6, y: (this.v.x * s + this.v.y * c) * .6 }; this.setMsg('Lipped out!', '#ffd28a'); }
+        }
+      } else if (this.gopherCheck(2.2)) return;
+      const nx = b.x + this.v.x * sdt; if (this.terr(nx, b.y) === 'wall') this.v.x = -this.v.x * .5; else b.x = nx;
+      const ny = b.y + this.v.y * sdt; if (this.terr(b.x, ny) === 'wall') this.v.y = -this.v.y * .5; else b.y = ny;
+      if (sp < .3) { this.v = { x: 0, y: 0 }; return this.resolve(false); }
+    }
+  },
+  penalty(kind) {
+    const b = this.ball;
+    if (kind === 'water') {
+      SFX.splash(); this.quip('water');
+      const sx = this.lastSafe.x, sy = this.lastSafe.y, d = Math.max(1, dist(b.x, b.y, sx, sy));
+      let dropped = false;
+      for (let i = 0; i <= d; i++) {
+        const px = lerp(b.x, sx, i / d), py = lerp(b.y, sy, i / d), t = this.terr(px, py);
+        if (t !== 'water' && t !== 'ob' && t !== 'wall') { const j = Math.min(d, i + 2); b.x = lerp(b.x, sx, j / d); b.y = lerp(b.y, sy, j / d); dropped = true; break; }
+      }
+      if (!dropped) { b.x = sx; b.y = sy; }
+      this.setMsg(this.mode === 'gopher' ? 'Splash!' : 'SPLASH!  +1 penalty stroke', '#8ac6ff', 1.8);
+    } else {
+      SFX.no(); this.quip('ob');
+      b.x = this.lastSafe.x; b.y = this.lastSafe.y;
+      this.setMsg(this.mode === 'gopher' ? 'Out of bounds!' : 'OUT OF BOUNDS!  +1, hit again', '#ff9a9a', 1.8);
+    }
+    b.z = 0; this.v = { x: 0, y: 0 };
+    if (this.mode === 'stroke' || this.mode === 'shed') this.strokes++;
+    this.state = 'result'; this.rt = 1.8; this.pending = 'penalty';
+  },
+  holed(dunk) {
+    this.ball.x = this.pin.x; this.ball.y = this.pin.y; this.ball.z = 0; this.v = { x: 0, y: 0 };
+    SFX.cup();
+    if (this.mode === 'blind') { this.goods++; this.setMsg('IN THE CUP!', '#9dff8a', 1.8); this.state = 'result'; this.rt = 1.8; this.pending = 'blind'; return; }
+    if (this.mode === 'shed') { this.setMsg('IN THE HOLE?!', '#9dff8a', 2); this.state = 'result'; this.rt = 2; this.pending = 'shedwin'; return; }
+    const d = this.strokes - this.def.par;
+    const names = { '-3': 'ALBATROSS!', '-2': 'EAGLE!', '-1': 'BIRDIE!', '0': 'PAR', '1': 'BOGEY', '2': 'DOUBLE BOGEY', '3': 'TRIPLE BOGEY' };
+    let n = this.strokes === 1 ? 'HOLE IN ONE!!' : (names[d] || (d > 0 ? '+' + d : d));
+    if (dunk && this.strokes > 1) n = 'SLAM DUNK! ' + n;
+    this.setMsg(n, d <= 0 ? '#9dff8a' : '#ffd28a', 4);
+    if (d <= 0) SFX.cheer();
+    this.quip('holed');
+    this.state = 'holed'; this.rt = 3.2;
+  },
+  resolve(bonked) {
+    this.ball.z = 0;
+    const t = this.terr(this.ball.x, this.ball.y); this.lie = t;
+    this.pending = 'next';
+    if (this.mode === 'gopher') {
+      this.balls--;
+      if (!bonked) { this.setMsg(pick(['Missed! He\'s laughing.', 'Whiff! The gopher dances.', 'Nope! He blew a raspberry.']), '#ffd28a', 1.6); this.quip('bad'); this.gst = 'taunt'; this.gt = 0; }
+      this.pending = this.bonks >= 3 ? 'gwin' : this.balls <= 0 ? 'glose' : 'gnext';
+    } else if (this.mode === 'blind') {
+      const d = dist(this.ball.x, this.ball.y, this.pin.x, this.pin.y);
+      if (d < 1.5) { this.goods++; this.setMsg('Close enough! (' + d.toFixed(1) + ' yds)', '#9dff8a', 1.8); }
+      else this.setMsg('Missed by ' + d.toFixed(1) + ' yds', '#ffd28a', 1.8);
+      this.pending = 'blind';
+    } else if (this.mode === 'shed') {
+      if (t === 'green') { this.setMsg('ON THE GREEN!', '#9dff8a', 2); this.pending = 'shedwin'; }
+      else if (this.strokes >= 3) { this.setMsg('Out of shots', '#ff9a9a', 2); this.pending = 'shedlose'; }
+      else this.setMsg(TER[t].name, '#fff', 1.4);
+    } else {
+      const lbl = { fairway: 'Fairway', rough: 'In the rough', sand: 'Bunker!', green: 'On the green', fringe: 'Fringe', tee: 'Tee box', path: 'Cart path bounce!', dirt: 'Gopher dirt!' };
+      this.setMsg(lbl[t] || TER[t].name, t === 'green' || t === 'fairway' ? '#9dff8a' : '#ffd28a', 1.4);
+      if (t === 'sand') this.quip('sand'); else if (t === 'green' || t === 'fairway') { if (Math.random() < .5) this.quip('good'); } else if (Math.random() < .5) this.quip('bad');
+      if (this.strokes >= this.def.par + 4) this.pending = 'pickup';
+    }
+    this.state = 'result'; this.rt = 1.5;
+  },
+  afterResult() {
+    this.msg = null;
+    switch (this.pending) {
+      case 'pickup': this.setMsg('Max score. Picked up.', '#ffd28a', 3); this.state = 'holed'; this.rt = 2.5; this.strokes = this.def.par + 4; SFX.fail(); return;
+      case 'gwin': return this.finish({ success: true, bonks: this.bonks });
+      case 'glose': return this.finish({ success: false, bonks: this.bonks });
+      case 'gnext': this.ball = { x: this.def.tee[0], y: this.def.tee[1], z: 0 }; this.moveGopher(); return this.newShot();
+      case 'shedwin': return this.finish({ success: true });
+      case 'shedlose': return this.finish({ success: false });
+      case 'blind':
+        this.pi++;
+        if (this.pi >= this.def.putts.length) return this.finish({ success: this.goods >= 2, goods: this.goods });
+        this.setupPutt(); this.state = 'peek'; this.t = 0; this.dark = false; return;
+      default: this.newShot();
+    }
+  },
+  finish(r) { this.state = 'done'; this.msg = null; this.res(r); },
+
+  // ---------- draw ----------
+  toS(x, y) { return [(x - this.cam.x) * this.cam.z + W / 2, (y - this.cam.y) * this.cam.z + H / 2]; },
+  draw() {
+    const z = this.cam.z, h = this.hole;
+    R(0, 0, W, H, '#1c421a');
+    ctx.imageSmoothingEnabled = false;
+    const [ox, oy] = this.toS(0, 0);
+    ctx.drawImage(h.cvs, Math.round(ox), Math.round(oy), Math.round(h.w * z), Math.round(h.h * z));
+    // water sparkle
+    const tt = performance.now() / 1000;
+    for (const [x, y, ph] of h.sparkles) if (Math.sin(tt * 2 + ph) > .85) { const [sx, sy] = this.toS(x, y); R(sx, sy, Math.max(1, z * .8), 1, '#cfe8ff'); }
+    // slope arrows when putting
+    const cl = this.clubs()[this.ci];
+    if (cl && cl.putt && (this.slope.x || this.slope.y) && !this.dark && (this.state === 'aim' || this.state === 'meter' || this.state === 'peek' || this.state === 'roll')) {
+      const a = Math.atan2(this.slope.y, this.slope.x), mag = Math.hypot(this.slope.x, this.slope.y);
+      const off = (tt * mag * 3) % 3;
+      ctx.fillStyle = 'rgba(255,255,255,.28)';
+      for (let y = 0; y < h.h; y += 3) for (let x = 0; x < h.w; x += 3) {
+        if (h.grid[y * h.w + x] !== TIDX.green) continue;
+        const [sx, sy] = this.toS(x + Math.cos(a) * off, y + Math.sin(a) * off);
+        if (sx < -5 || sy < -5 || sx > W + 5 || sy > H + 5) continue;
+        ctx.fillRect(sx, sy, 2, 2); ctx.fillRect(sx - Math.cos(a) * 3 - Math.sin(a) * 2, sy - Math.sin(a) * 3 + Math.cos(a) * 2, 1.5, 1.5); ctx.fillRect(sx - Math.cos(a) * 3 + Math.sin(a) * 2, sy - Math.sin(a) * 3 - Math.cos(a) * 2, 1.5, 1.5);
+      }
+    }
+    // gopher holes
+    if (this.mode === 'gopher') {
+      this.def.gholes.forEach(([gx, gy], i) => {
+        const [sx, sy] = this.toS(gx, gy);
+        ctx.fillStyle = '#7a5230'; ctx.beginPath(); ctx.ellipse(sx, sy, 3.2 * z, 2.2 * z, 0, 0, 7); ctx.fill();
+        ctx.fillStyle = '#2a1a0a'; ctx.beginPath(); ctx.ellipse(sx, sy, 1.4 * z, 1 * z, 0, 0, 7); ctx.fill();
+        if (i === this.gi && this.gst !== 'hidden') {
+          const up = this.gst === 'dizzy' ? 1 : Math.min(1, this.gt * 4);
+          ctx.save(); ctx.beginPath(); ctx.rect(sx - 20, sy - 40, 40, 40 + 1 * z); ctx.clip();
+          drawGopher(sx, sy + (1 - up) * 14 * z / 2.6, 2, this.gst === 'taunt');
+          ctx.restore();
+          if (this.gst === 'dizzy') for (let k = 0; k < 3; k++) { const a = tt * 5 + k * 2.1; txt('*', sx + Math.cos(a) * 10 - 4, sy - 34 + Math.sin(a) * 3, '#ffe066'); }
+        }
+      });
+    }
+    // pin and cup
+    if (this.mode !== 'gopher') {
+      const [px, py] = this.toS(this.pin.x, this.pin.y);
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(px, py, Math.max(2, CUP_R * z), 0, 7); ctx.fill();
+      if (this.state !== 'holed' || this.rt > 2.5) {
+        const fh = 26, wv = Math.sin(tt * 4) * 2;
+        R(px - 1 + 5, py - 2, 8, 2, 'rgba(0,0,0,.25)');
+        R(px - 1, py - fh, 2, fh, '#f2f2f2');
+        ctx.fillStyle = this.def.storm ? '#ffcc00' : '#e53935'; ctx.beginPath(); ctx.moveTo(px + 1, py - fh); ctx.lineTo(px + 14, py - fh + 4 + wv); ctx.lineTo(px + 1, py - fh + 9); ctx.fill();
+      }
+    }
+    // aim line + reticle
+    if ((this.state === 'aim' || this.state === 'meter') && !this.scout) {
+      const rp = this.reticle(); const [bx, by] = this.toS(this.ball.x, this.ball.y); const [rx, ry] = this.toS(rp.x, rp.y);
+      const n = Math.max(4, Math.floor(Math.hypot(rx - bx, ry - by) / 7));
+      const len = this.dark ? Math.min(n, 5) : n;
+      for (let i = 1; i < len; i++) { const k = i / n; if ((i + Math.floor(tt * 8)) % 2) R(lerp(bx, rx, k) - 1, lerp(by, ry, k) - 1, 2, 2, 'rgba(255,255,255,.85)'); }
+      if (!this.dark) {
+        ctx.strokeStyle = cl && cl.putt ? 'rgba(255,255,255,.6)' : '#ffe066'; ctx.lineWidth = 1.5;
+        const rr = cl && cl.putt ? 3 : Math.max(5, 6 * z);
+        ctx.beginPath(); ctx.arc(rx, ry, rr, 0, 7); ctx.stroke(); R(rx - 1, ry - 1, 2, 2, '#ffe066');
+      }
+    }
+    // companion + golfer
+    {
+      const comp = CH[this.def.comp];
+      if (comp && comp.sp && this.mode !== 'blind') { const [cx, cy] = this.toS(this.golfer.x - Math.cos(this.aim) * 5 + Math.sin(this.aim) * 5, this.golfer.y - Math.sin(this.aim) * 5 - Math.cos(this.aim) * 5); drawTopPerson(cx - 10, cy + 8, comp.sp); }
+      const [gx, gy] = this.toS(this.golfer.x, this.golfer.y);
+      let sw = this.swingA;
+      if (this.swingAnim > 0) { this.swingAnim -= lastDt; sw = lerp(-2.2, this.swingA, this.swingAnim / .35); if (this.swingAnim <= 0) this.swingA = -2.2; }
+      if (this.state === 'aim' || this.state === 'meter' || this.state === 'peek') { if (this.swingAnim <= 0 && this.state === 'aim') sw = .2; }
+      drawTopGolfer(gx, gy, this.aim || 0, CH.kip.sp, sw);
+    }
+    // ball
+    if (this.state !== 'holed') {
+      const [bx, by] = this.toS(this.ball.x, this.ball.y);
+      const bz = this.ball.z * z * .8, br = Math.max(1.5, .55 * z) + this.ball.z * .05;
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(bx + bz * .25, by + 1, br, br * .6, 0, 0, 7); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(bx, by - bz, br, 0, 7); ctx.fill();
+      R(bx - br * .4, by - bz - br * .4, 1, 1, '#ccc');
+    }
+    // darkness for blind putting
+    if (this.dark && this.state !== 'result') {
+      const [bx, by] = this.toS(this.ball.x, this.ball.y);
+      ctx.fillStyle = 'rgba(0,0,0,.965)'; ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.arc(bx, by, 26, 0, 7, true); ctx.fill('evenodd');
+      otxt('Eyes closed. Be the ball...', W / 2, 60, '#ffe27a', 8);
+    }
+    // rain & lightning
+    if (this.def.storm) {
+      ctx.strokeStyle = 'rgba(180,200,255,.45)'; ctx.lineWidth = 1; ctx.beginPath();
+      for (const r of this.rain) { ctx.moveTo(r[0], r[1]); ctx.lineTo(r[0] - 3, r[1] + 9); } ctx.stroke();
+      R(0, 0, W, H, 'rgba(20,20,50,.22)');
+      if (this.flash > 0) R(0, 0, W, H, 'rgba(255,255,255,' + (this.flash * 2.4) + ')');
+    }
+    this.drawHUD();
+  },
+  drawHUD() {
+    const d = this.def, b = this.ball, cl = this.clubs()[this.ci] || CLUBS[0];
+    R(0, 0, W, 20, 'rgba(0,0,0,.6)');
+    const title = (d.num !== '-' ? 'HOLE ' + d.num + ' · ' : '') + d.name.toUpperCase();
+    txt(title, 8, 6, '#ffe066');
+    if (this.mode === 'stroke') { txt('PAR ' + d.par, 330, 6, '#fff'); txt('STROKES ' + this.strokes, 400, 6, '#fff'); }
+    if (this.mode === 'gopher') txt('BONKS ' + this.bonks + '/3   BALLS ' + this.balls, 300, 6, '#fff');
+    if (this.mode === 'blind') txt('PUTT ' + Math.min(3, this.pi + 1) + '/3   GOOD ' + this.goods + ' (need 2)', 250, 6, '#fff');
+    if (this.mode === 'shed') txt('SHOTS ' + this.strokes + '/3  Reach the green!', 250, 6, '#fff');
+    // wind
+    if (d.maxWind !== 0 || d.wind) {
+      const wx = 612, wy = 10; txt(this.windMph + 'mph', 588, 6, '#bfe6ff', 8, 'right');
+      if (this.windMph > 0) { ctx.save(); ctx.translate(wx, wy); ctx.rotate(this.windA); ctx.fillStyle = '#bfe6ff'; ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(5, 2); ctx.lineTo(1.5, 2); ctx.lineTo(1.5, 8); ctx.lineTo(-1.5, 8); ctx.lineTo(-1.5, 2); ctx.lineTo(-5, 2); ctx.fill(); ctx.restore(); }
+    }
+    if (this.opts.tourney) { const tot = this.opts.tourney(); txt('TOURNEY ' + tot, 8, 26, '#ffd28a'); }
+    // minimap
+    if (this.mode === 'stroke' || this.mode === 'shed') {
+      const h = this.hole, s = Math.min(70 / h.w, 130 / h.h), mw = h.w * s, mh = h.h * s, mx = W - mw - 8, my = 26;
+      R(mx - 2, my - 2, mw + 4, mh + 4, 'rgba(0,0,0,.6)');
+      ctx.imageSmoothingEnabled = true; ctx.drawImage(h.cvs, mx, my, mw, mh); ctx.imageSmoothingEnabled = false;
+      R(mx + this.pin.x * s - 1, my + this.pin.y * s - 1, 3, 3, '#e53935');
+      R(mx + b.x * s - 1, my + b.y * s - 1, 3, 3, '#fff');
+      const v = { hw: W / 2 / this.cam.z, hh: H / 2 / this.cam.z };
+      ctx.save(); ctx.beginPath(); ctx.rect(mx, my, mw, mh); ctx.clip();
+      ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1; ctx.strokeRect(mx + (this.cam.x - v.hw) * s, my + (this.cam.y - v.hh) * s, v.hw * 2 * s, v.hh * 2 * s);
+      ctx.restore();
+    }
+    // bottom info
+    if (this.state === 'aim' || this.state === 'meter') {
+      R(0, H - 40, W, 40, 'rgba(0,0,0,.6)');
+      const tg = this.target(); const dp = Math.round(dist(b.x, b.y, tg.x, tg.y));
+      txt(cl.name, 10, H - 34, '#ffe066');
+      txt(cl.putt ? 'max ' + PUTT_MAX + 'y' : Math.round(cl.carry * this.lieFactor(cl)) + 'y carry', 10, H - 22, '#fff');
+      txt((TER[this.lie] ? TER[this.lie].name : '') + (this.mode === 'gopher' ? ' · gopher ' : ' · pin ') + dp + 'y', 10, H - 10, '#bfe6ff');
+      this.drawMeter(cl, dp);
+      if (this.scout) txt('LOOKING AROUND  (C/X or B to return)', W - 8, H - 22, '#ffe066', 8, 'right');
+      else { txt('L/R aim  U/D club', W - 8, H - 34, '#9fb39a', 8, 'right'); txt('Z/A swing  C/X look', W - 8, H - 22, '#9fb39a', 8, 'right'); txt(this.state === 'meter' ? 'B cancel' : 'Q/E nudge aim', W - 8, H - 10, '#9fb39a', 8, 'right'); }
+    }
+    // message
+    if (this.msg) { const m = this.msg; const sz = m.t.length > 18 ? 8 : 16; otxt(m.t, W / 2, 120, m.col, sz); }
+    if (this.state === 'intro' || this.state === 'pre') {
+      const w = 360; panel((W - w) / 2, 250, w, 50);
+      txt((d.num !== '-' ? 'HOLE ' + d.num + ' — ' : '') + d.name, W / 2, 262, '#ffe066', 8, 'center');
+      const yd = Math.round(dist(d.tee[0], d.tee[1], d.pin[0], d.pin[1]));
+      txt(this.mode === 'stroke' ? 'PAR ' + d.par + '   ' + yd + ' YARDS' : this.mode === 'gopher' ? 'Bonk the gopher 3 times. 8 balls.' : this.mode === 'shed' ? 'Chip through the window. 3 shots.' : '', W / 2, 280, '#fff', 8, 'center');
+    }
+    if (this.state === 'peek') otxt('Study the green... (' + Math.max(0, Math.ceil(2.8 - this.t)) + ')', W / 2, 60, '#ffe27a', 8);
+    if (this.bubble) {
+      const c = CH[this.bubble.who]; const lines = wrap(this.bubble.text, 50); const y = this.opts.tourney ? 40 : 28;
+      R(8, y, 14 + Math.max(...lines.map(l => l.length)) * 8, 16 + lines.length * 11, 'rgba(0,0,0,.72)');
+      txt(c.name.toUpperCase() + ':', 14, y + 4, c.col); lines.forEach((l, i) => txt(l, 14, y + 15 + i * 11, '#fff'));
+    }
+  },
+  drawMeter(cl, dp) {
+    const mx = 158, mw = 232, my = H - 30, mh = 14;
+    const X = v => mx + (v + .22) / 1.22 * mw;
+    R(mx - 3, my - 3, mw + 6, mh + 6, '#000'); R(mx, my, mw, mh, '#2a2a2a');
+    ctx.fillStyle = '#3c6e3c'; ctx.fillRect(X(0), my, X(1) - X(0), mh);
+    for (let i = 1; i < 4; i++) R(X(i / 4), my, 1, mh, 'rgba(255,255,255,.2)');
+    R(X(-.025), my - 2, X(.025) - X(-.025), mh + 4, '#ffe066');
+    R(X(-.22), my, X(-.1) - X(-.22), mh, '#6b2a2a'); R(X(.1), my, 4, mh, 'rgba(255,255,255,0)');
+    // pin distance marker
+    let pf = cl.putt ? dp / PUTT_MAX : dp / (cl.carry * this.lieFactor(cl));
+    if (pf <= 1.05) { const px = X(Math.min(1, pf)); ctx.fillStyle = '#e53935'; ctx.beginPath(); ctx.moveTo(px, my - 1); ctx.lineTo(px - 4, my - 8); ctx.lineTo(px + 4, my - 8); ctx.fill(); }
+    txt('0', X(0) - 3, my + mh + 3, '#888'); txt('MAX', X(1) - 12, my + mh + 3, '#888');
+    if (this.m) {
+      if (this.m.ph === 'acc') { const pp = X(this.m.p); R(pp - 1, my - 3, 3, mh + 6, '#ff5252'); }
+      const cx = X(this.m.v); R(cx - 1, my - 5, 3, mh + 10, '#fff');
+      if (this.m.ph !== 'acc') R(X(0), my + 2, cx - X(0), mh - 4, 'rgba(255,224,102,.55)');
+    }
+  },
+};
+
+// ============================================================
+//  ADVENTURE: side-scrolling rooms, verb grid, inventory
+// ============================================================
+const VERBS = ['Look at', 'Pick up', 'Use', 'Talk to', 'Give', 'Open'];
+const FOOT = 240, SCENE_H = 262;
+const ADV = { room: null, x: 150, face: 1, walk: 0, verb: 0, item: -1, target: null, lock: null, auto: null, talker: null };
+
+function vis(s) { return !s.show || s.show(); }
+function spotBox(s) {
+  if (s.actor) { const a = ADV.room.actors.find(a => a.id === s.actor); return { x: a.x - 16, y: (a.y ?? FOOT) - 90, w: 32, h: 90 }; }
+  return s;
+}
+function spotCX(s) { const b = spotBox(s); return b.x + b.w / 2; }
+function nearbySpots() {
+  return ADV.room.spots.filter(vis).map(s => { const b = spotBox(s); const cx = b.x + b.w / 2; return { s, d: Math.max(0, Math.abs(cx - ADV.x) - b.w / 2) }; })
+    .filter(o => o.d < 46).sort((a, b) => a.d - b.d).map(o => o.s);
+}
+function actor(id) { return ADV.room.actors.find(a => a.id === id); }
+
+async function goRoom(id, x, face = 1) {
+  await fadeOut(.3);
+  enterRoom(id, x, face);
+  await fadeIn(.3);
+}
+function enterRoom(id, x, face = 1) {
+  const r = ROOMS[id];
+  ADV.room = r; G.room = id; ADV.x = x ?? r.startX ?? 150; ADV.face = face; ADV.target = null; ADV.lock = null; ADV.auto = null; ADV.item = -1;
+  G.x = ADV.x;
+  if (r.init) r.init();
+  setScene(AdvScene);
+  playSong(r.song || 'adv');
+  if (r.enter) run(r.enter);
+}
+function walkTo(x) {
+  x = clamp(x, ADV.room.minX ?? 24, ADV.room.maxX ?? 616);
+  return new Promise(res => { if (Math.abs(x - ADV.x) < 2) return res(); ADV.auto = { x, res }; });
+}
+function moveActor(id, x, speed = 90) {
+  const a = actor(id);
+  return new Promise(res => { a.goal = { x, res, speed }; });
+}
+function standX(s) {
+  if (s.sx !== undefined) return s.sx;
+  const b = spotBox(s), cx = b.x + b.w / 2;
+  if (s.actor) {
+    const lo = ADV.room.minX ?? 24, hi = ADV.room.maxX ?? 616;
+    let x = ADV.x <= cx ? cx - 40 : cx + 40;
+    if (x < lo || x > hi) x = ADV.x <= cx ? cx + 40 : cx - 40;
+    return Math.abs(ADV.x - cx) >= 36 && Math.abs(ADV.x - cx) <= 70 ? ADV.x : x;
+  }
+  if (Math.abs(ADV.x - cx) <= b.w / 2 + 30) return ADV.x;
+  return ADV.x < cx ? cx - b.w / 2 - 22 : cx + b.w / 2 + 22;
+}
+function faceSpot(s) { ADV.face = spotCX(s) >= ADV.x ? 1 : -1; }
+
+const DEFAULTS = {
+  'Look at': s => s.look || ('It\'s ' + (/^[aeiou]/i.test(s.name) ? 'an ' : 'a ') + s.name.toLowerCase() + '.'),
+  'Pick up': () => pick(["I don't need that.", "That's staying right where it is.", "Nope. Not mine to take.", "I'd rather not."]),
+  'Use': (s, it) => it ? pick(["The " + ITEMS[it].name.toLowerCase() + " and the " + s.name.toLowerCase() + " don't go together.", "That doesn't do anything.", "Nice try. No."]) : pick(["I can't use that.", "How would I even use that?"]),
+  'Talk to': s => pick(["Hello, " + s.name.toLowerCase() + ". ...Nothing.", "It's not much of a talker.", "I'm talking to a " + s.name.toLowerCase() + ". The summer heat is getting to me."]),
+  'Give': (s, it) => it ? "I'd rather hang on to the " + ITEMS[it].name.toLowerCase() + "." : "Give what? Pick an item first with Tab (or Y).",
+  'Open': () => pick(["It doesn't open.", "There's nothing to open."]),
+};
+
+async function doVerb() {
+  const s = ADV.target, v = VERBS[ADV.verb], it = ADV.item >= 0 ? G.inv[ADV.item] : null;
+  if (!s) { await say('kip', pick(["There's nothing here. Walk closer to something.", "Nothing to " + v.toLowerCase() + " around here."])); return; }
+  await walkTo(standX(s)); faceSpot(s);
+  if (s.exit && v !== 'Look at') { SFX.door(); await s.go(); return; }
+  if (s.actor) ADV.talker = s.actor;
+  let handled = false;
+  if (s.act) handled = await s.act(v, it);
+  if (handled !== true) await say('kip', DEFAULTS[v](s, it));
+  ADV.talker = null;
+}
+
+const AdvScene = {
+  pausable: true,
+  update(dt, blocked) {
+    const r = ADV.room;
+    // scripted actor movement
+    for (const a of r.actors) {
+      if (a.goal) {
+        const d = a.goal.x - a.x, st = a.goal.speed * dt;
+        if (Math.abs(d) <= st) { a.x = a.goal.x; a.walk = 0; const g = a.goal; a.goal = null; g.res(); }
+        else { a.x += Math.sign(d) * st; a.face = Math.sign(d); a.walk = (a.walk || 0) + dt; }
+      }
+    }
+    const minX = r.minX ?? 24, maxX = r.maxX ?? 616;
+    if (ADV.auto) {
+      const d = ADV.auto.x - ADV.x, st = 130 * dt;
+      if (Math.abs(d) <= st) { ADV.x = ADV.auto.x; ADV.walk = 0; const a = ADV.auto; ADV.auto = null; a.res(); }
+      else { ADV.x += Math.sign(d) * st; ADV.face = Math.sign(d); ADV.walk += dt; }
+      return;
+    }
+    if (blocked || BUSY) { ADV.walk = 0; return; }
+    let mv = 0;
+    if (isDown('left')) mv -= 1; if (isDown('right')) mv += 1;
+    if (mv) { ADV.x = clamp(ADV.x + mv * 130 * dt, minX, maxX); ADV.face = mv; ADV.walk += dt; } else ADV.walk = 0;
+    G.x = ADV.x;
+    const near = nearbySpots();
+    if (ADV.lock && !near.includes(ADV.lock)) ADV.lock = null;
+    if ((rep('up') || rep('down')) && near.length > 1) {
+      const sorted = near.slice().sort((a, b) => spotCX(a) - spotCX(b));
+      const cur = ADV.lock || near[0]; let i = sorted.indexOf(cur);
+      i = (i + (IN.down.up ? 1 : -1) + sorted.length) % sorted.length;
+      ADV.lock = sorted[i]; SFX.move();
+    }
+    ADV.target = ADV.lock || near[0] || null;
+    if (rep('lb')) { ADV.verb = (ADV.verb + VERBS.length - 1) % VERBS.length; SFX.move(); }
+    if (rep('rb')) { ADV.verb = (ADV.verb + 1) % VERBS.length; SFX.move(); }
+    for (let i = 1; i <= 6; i++) if (hit('v' + i)) { ADV.verb = i - 1; SFX.move(); }
+    if (hit('y')) {
+      if (!G.inv.length) { toast('Your pockets are empty'); }
+      else { ADV.item = ADV.item + 1 >= G.inv.length ? -1 : ADV.item + 1; SFX.move(); if (ADV.item >= 0 && ADV.verb !== 2 && ADV.verb !== 4) ADV.verb = 2; }
+    }
+    if (hit('x')) {
+      if (ADV.item >= 0) { const id = G.inv[ADV.item]; run(() => say('kip', ITEMS[id].desc)); }
+      else toast('Select an item with Tab / Y to examine it');
+    }
+    if (hit('b')) { if (ADV.item >= 0) { ADV.item = -1; SFX.no(); } }
+    if (hit('a')) run(doVerb);
+  },
+  draw() {
+    const r = ADV.room;
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, SCENE_H); ctx.clip();
+    r.draw();
+    for (const s of r.spots) if (!s.front && s.draw && vis(s)) s.draw();
+    const people = r.actors.filter(a => !a.show || a.show()).map(a => ({ x: a.x, f: () => drawPerson(a.x, a.y ?? FOOT, CH[a.id].sp, a.face, a.walk || 0, { talk: DLG.cur && DLG.cur.who === a.id, blind: a.blind }) }));
+    people.push({ x: ADV.x, f: () => drawPerson(ADV.x, FOOT, CH.kip.sp, ADV.face, ADV.walk, { talk: DLG.cur && DLG.cur.who === 'kip' }) });
+    people.forEach(p => p.f());
+    for (const s of r.spots) if (s.front && s.draw && vis(s)) s.draw();
+    if (r.drawFront) r.drawFront();
+    // target highlight
+    const t = ADV.target;
+    if (t && !DLG.cur && !BUSY) {
+      const b = spotBox(t), bl = Math.floor(performance.now() / 250) % 2;
+      const c = bl ? '#ffe066' : '#fff';
+      const x0 = b.x - 3, y0 = b.y - 3, x1 = b.x + b.w + 3, y1 = b.y + b.h + 3;
+      for (const [x, y, dx, dy] of [[x0, y0, 1, 1], [x1, y0, -1, 1], [x0, y1, 1, -1], [x1, y1, -1, -1]]) { R(Math.min(x, x + dx * 8), y - (dy < 0 ? 2 : 0), 8, 2, c); R(x - (dx < 0 ? 2 : 0), Math.min(y, y + dy * 8), 2, 8, c); }
+      otxt(t.name + (t.exit ? '  ►' : ''), clamp(b.x + b.w / 2, 70, W - 70), Math.max(26, b.y - 16), '#ffe066');
+    }
+    ctx.restore();
+    // top info bar (hidden during dialog)
+    if (!DLG.cur) {
+      const goal = goalText();
+      R(0, 0, W, 16, 'rgba(0,0,0,.55)');
+      txt(r.name, 6, 4, '#c9a94a');
+      if (goal) txt('GOAL: ' + goal, W / 2 + 20, 4, '#fff', 8, 'center');
+      txt('$' + G.money, W - 6, 4, '#9dff8a', 8, 'right');
+    }
+    drawVerbUI();
+  },
+};
+
+function sentence() {
+  const v = VERBS[ADV.verb], it = ADV.item >= 0 ? ITEMS[G.inv[ADV.item]].name : null, t = ADV.target;
+  let s = v;
+  if (it) s += ' ' + it + (v === 'Give' ? ' to' : ' with');
+  if (t) s += ' ' + t.name;
+  return s;
+}
+function drawVerbUI() {
+  R(0, SCENE_H, W, H - SCENE_H, '#101410'); R(0, SCENE_H, W, 2, '#3a4a2a');
+  txt(sentence(), W / 2, SCENE_H + 6, '#7fe8ff', 8, 'center');
+  VERBS.forEach((v, i) => {
+    const cx = 10 + (i % 3) * 102, cy = SCENE_H + 22 + Math.floor(i / 3) * 26;
+    const sel = i === ADV.verb;
+    R(cx, cy, 96, 22, sel ? '#2f5d36' : '#1b231b');
+    if (sel) { R(cx, cy, 96, 2, '#ffe066'); R(cx, cy + 20, 96, 2, '#ffe066'); }
+    txt((i + 1) + ' ' + v, cx + 48, cy + 8, sel ? '#ffe066' : '#6fa86f', 8, 'center');
+  });
+  const ix = 322, iy = SCENE_H + 18;
+  for (let k = 0; k < 8; k++) {
+    const cx = ix + (k % 4) * 78, cy = iy + Math.floor(k / 4) * 33;
+    const id = G.inv[k], sel = ADV.item === k;
+    R(cx, cy, 74, 31, sel ? '#3a2f10' : '#161c16');
+    if (sel) { R(cx, cy, 74, 2, '#ffe066'); R(cx, cy + 29, 74, 2, '#ffe066'); R(cx, cy, 2, 31, '#ffe066'); R(cx + 72, cy, 2, 31, '#ffe066'); }
+    if (id) { drawItem(id, cx + 23, cy + 1); txt(ITEMS[id].name, cx + 37, cy + 21, sel ? '#ffe066' : '#bbb', 8, 'center', null); }
+  }
+  txt('Arrows walk/target  Q/E verb  Tab item  Z act  C examine  P pause', W / 2, H - 9, '#55705a', 8, 'center', null);
+}
+
+// ============================================================
+//  STORY: rooms, puzzles, scripts
+// ============================================================
+function goalText() {
+  switch (G.stage) {
+    case 0: return 'Pick up that blood (Lou\'s orders)';
+    case 1: return 'Caddy for Judge Smails';
+    case 2: return 'Help Ty Webb play through Carl\'s shed';
+    case 3: return F.hoseGiven ? 'Help Carl bonk the gopher' : has('hose') ? 'Bring the pump hose to Carl' : 'Get the pool\'s pump hose for Carl';
+    case 4: return 'Caddy for Al Czervik at the First Tee';
+    case 5: return has('baroo') ? 'Return Billy Baroo to the Judge' : F.askedSmails ? 'Fish Billy Baroo out of the pond' : 'Ask Judge Smails to sponsor you';
+    case 6: return 'Win the tournament: shoot 24 or better';
+  }
+  return '';
+}
+async function playGolf(id, opts) {
+  await fadeOut(.35);
+  const p = Golf.start(id, opts);
+  fadeIn(.35);
+  return p;
+}
+const sayK = t => say('kip', t);
+
+// ---------- background helpers ----------
+function sky(top = '#86cdf2', bot = '#bfe6fa', h = 160) {
+  for (let i = 0; i < 8; i++) R(0, i * h / 8, W, h / 8 + 1, shade(top, 1 + i * .03));
+  R(0, h - 20, W, 20, bot);
+}
+function cloud(x, y) { R(x, y, 60, 12, '#fff'); R(x + 10, y - 8, 30, 10, '#fff'); R(x + 34, y - 4, 20, 8, '#fff'); }
+function bush(x, y, w, c = '#2f6b2a') { R(x, y, w, 20, c); R(x + 6, y - 8, w - 12, 10, shade(c, 1.15)); }
+function planks(x, y, w, h, c, step = 32) { R(x, y, w, h, c); for (let i = x; i < x + w; i += step) R(i, y, 2, h, shade(c, .8)); }
+
+// ============================================================
+const ROOMS = {};
+
+// ---------------- THE CADDYSHACK ----------------
+ROOMS.caddyshack = {
+  name: 'CADDYSHACK', minX: 40, maxX: 596,
+  actors: [{ id: 'lou', x: 540, face: -1, show: () => !F.louAway }],
+  draw() {
+    planks(0, 0, W, 200, '#5a3d24');
+    for (let x = 16; x < W; x += 64) R(x, 30, 1, 160, '#664630');
+    R(0, 0, W, 12, '#2e1e10');
+    for (let y = 198; y < SCENE_H; y += 16) for (let x = 0; x < W; x += 32) R(x, y, 32, 16, ((x / 32 + (y - 198) / 16) % 2) ? '#7b7b5f' : '#6a6a51');
+    R(0, 194, W, 6, '#2b1c0e');
+    // window
+    R(188, 48, 96, 74, '#2e1e10'); R(194, 54, 84, 62, '#8fd3ff'); R(194, 94, 84, 22, '#4caf50'); R(250, 74, 2, 22, '#fff'); R(252, 74, 8, 5, '#e53935'); R(235, 54, 3, 62, '#2e1e10'); R(194, 84, 84, 3, '#2e1e10');
+    // no betting sign (Lou sits right under the next one)
+    R(300, 52, 64, 32, '#f4f1e0'); txt('NO', 332, 57, '#c0392b', 8, 'center', null); txt('BETTING', 332, 70, '#c0392b', 8, 'center', null);
+    for (const x of [150, 440]) { R(x, 12, 1, 28, '#222'); R(x - 3, 40, 7, 8, '#fff6a0'); }
+  },
+  spots: [
+    { name: 'Door', x: 20, y: 98, w: 56, h: 142, exit: true, look: 'The door out to the caddy yard.',
+      draw() { R(16, 94, 64, 146, '#2e1e10'); R(22, 100, 52, 140, '#7b5530'); R(28, 108, 40, 50, '#6b4526'); R(28, 170, 40, 60, '#6b4526'); R(64, 168, 6, 6, '#d4af37'); R(26, 78, 44, 13, '#c0392b'); txt('EXIT', 48, 81, '#fff', 8, 'center', null); },
+      go: () => goRoom('caddyyard', 95, 1) },
+    { name: 'Bulletin Board', x: 92, y: 58, w: 84, h: 60,
+      draw() { R(92, 58, 84, 60, '#3b2614'); R(96, 62, 76, 52, '#b8864b'); R(100, 66, 30, 22, '#fff'); R(134, 66, 34, 18, '#ffe066'); R(104, 92, 26, 18, '#ffd0d0'); R(138, 88, 28, 22, '#fff'); R(112, 64, 3, 3, '#c00'); R(150, 64, 3, 3, '#00c'); },
+      async act(v) {
+        if (v === 'Look at') {
+          await say('nar', 'BUSHWOOD CADDY SCHOLARSHIP TOURNAMENT. Five holes. Par 20. Sponsored by Judge Elihu Smails. Entry by the Judge\'s approval only.');
+          await say('nar', 'Someone has scrawled underneath: "Last year\'s winner shot 24. Beat that or go dig ditches."');
+          await sayK('Twenty-four. Four over par. I can do that. Probably. Maybe.');
+          return true;
+        }
+        if (v === 'Pick up') { await sayK('Lou would kill me. Then he\'d charge me for the thumbtacks.'); return true; }
+      } },
+    { name: 'Window', x: 188, y: 48, w: 96, h: 74, look: 'The ninth green. Someday I\'ll play it without somebody\'s bag on my back.',
+      async act(v) { if (v === 'Open') { await sayK('Painted shut. Everything in here is painted shut, sticky, or Lou\'s.'); return true; } } },
+    { name: 'Couch', x: 176, y: 176, w: 120, h: 62,
+      draw() { R(172, 186, 12, 44, '#56761b'); R(290, 186, 12, 44, '#56761b'); R(180, 174, 114, 22, '#5a7a1d'); R(180, 196, 114, 32, '#6b8e23'); R(236, 196, 2, 26, '#56761b'); R(182, 228, 6, 10, '#2e1e10'); R(286, 228, 6, 10, '#2e1e10'); R(252, 200, 8, 4, '#eee'); R(200, 180, 10, 3, '#4a6a15'); },
+      async act(v) {
+        if (v === 'Look at') { await sayK('A couch that has seen things. Terrible, terrible things.'); return true; }
+        if (v === 'Pick up' || v === 'Open' || v === 'Use') {
+          if (!F.quarter) {
+            F.quarter = 1;
+            await say('nar', 'Kip digs through the cushions: a bottle cap, half a tee, something fuzzy that used to be a Twinkie... and a quarter!');
+            giveItem('quarter'); return true;
+          }
+          await sayK('Just crumbs and regret now.'); return true;
+        }
+        if (v === 'Talk to') { await sayK('You and me, couch. We\'re gonna get through this summer.'); return true; }
+      } },
+    { name: 'Blood', x: 300, y: 238, w: 56, h: 14, show: () => !F.clean,
+      draw() { ctx.fillStyle = '#7a0000'; ctx.beginPath(); ctx.ellipse(328, 246, 28, 6, 0, 0, 7); ctx.fill(); ctx.fillStyle = '#a30f0f'; ctx.beginPath(); ctx.ellipse(322, 245, 14, 3, 0, 0, 7); ctx.fill(); R(346, 243, 5, 3, '#7a0000'); R(357, 247, 3, 2, '#7a0000'); },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK('A puddle of blood. Tony\'s, mostly. A little bit of Motormouth\'s. And some Pepsi.'); return true; }
+        if (v === 'Pick up') { await sayK('"Pick up that blood." I\'m pretty sure Lou means with a mop.'); return true; }
+        if (v === 'Use' && it === 'mop') { if (!has('water')) { await sayK('Dry-mopping blood just makes a bigger, streakier puddle. I need a bucket of water.'); return true; } await cleanBlood(); return true; }
+        if (v === 'Use' && it === 'water') { if (!has('mop')) { await sayK('Just water? That\'s a pink puddle. I need the mop too.'); return true; } await cleanBlood(); return true; }
+        if (v === 'Use' && it === 'bucket') { await sayK('The bucket\'s empty. I need to fill it somewhere.'); return true; }
+        if (v === 'Talk to') { await sayK('Hey, blood. You gonna leave on your own? No? Figured.'); return true; }
+      } },
+    { name: 'Supply Closet', x: 372, y: 98, w: 58, h: 140,
+      draw() {
+        R(368, 94, 66, 146, '#2e1e10');
+        if (F.closetOpen) { R(374, 100, 54, 140, '#161010'); R(378, 118, 46, 3, '#4a3119'); R(380, 106, 10, 12, '#3a78c8'); R(394, 108, 12, 10, '#e8e2c8'); R(408, 110, 10, 8, '#c0392b'); R(420, 100, 8, 140, '#4f6b5a'); }
+        else { R(374, 100, 54, 140, '#4f6b5a'); R(380, 110, 42, 14, '#e8e2c8'); txt('SUPPLY', 401, 113, '#222', 8, 'center', null); R(418, 170, 5, 8, '#d4af37'); }
+      },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK(F.closetOpen ? 'Supplies. Mostly empty bottles with Lou\'s name on them.' : 'The supply closet. SUPPLY, it says. Supply of what, it doesn\'t say. Locked.'); return true; }
+        if (v === 'Open' || (v === 'Use' && it === 'keys')) {
+          if (F.closetOpen) { await sayK('It\'s already open.'); return true; }
+          if (!has('keys')) { SFX.no(); await sayK('Locked tight. The key\'s gotta be on Lou\'s key ring.'); return true; }
+          SFX.door(); F.closetOpen = 1; await say('nar', 'Kip tries eleven keys. The twelfth one works. The closet creaks open.'); return true;
+        }
+      } },
+    { name: 'Mop', x: 384, y: 128, w: 30, h: 108, show: () => F.closetOpen && !F.gotMop,
+      draw() { R(397, 128, 4, 90, '#b98a4a'); R(386, 216, 26, 20, '#e8e2c8'); R(388, 226, 2, 10, '#bfb8a0'); R(396, 226, 2, 10, '#bfb8a0'); R(404, 226, 2, 10, '#bfb8a0'); },
+      async act(v) {
+        if (v === 'Pick up') { F.gotMop = 1; giveItem('mop'); return true; }
+        if (v === 'Look at') { await sayK('A mop. It looks like it has already mopped up several crimes.'); return true; }
+      } },
+    { name: 'Bucket', x: 438, y: 214, w: 28, h: 26, show: () => !F.gotBucket,
+      draw() { R(438, 214, 28, 4, '#9aa0a6'); R(440, 218, 24, 20, '#7d848a'); R(444, 218, 3, 20, '#a9afb4'); R(446, 206, 12, 2, '#555'); },
+      async act(v) {
+        if (v === 'Pick up') { F.gotBucket = 1; giveItem('bucket'); return true; }
+        if (v === 'Look at') { await sayK('A mop bucket. Empty. The sink in here only makes brown water, so I\'d need another water source.'); return true; }
+      } },
+    { name: 'Key Ring', x: 460, y: 102, w: 18, h: 24, show: () => !F.gotKeys,
+      draw() { R(467, 100, 4, 4, '#888'); R(463, 104, 12, 12, '#d4af37'); R(466, 107, 6, 6, '#5a3d24'); R(462, 114, 3, 10, '#d4af37'); R(470, 115, 3, 9, '#c0c0c0'); R(474, 113, 3, 8, '#d4af37'); },
+      async act(v) {
+        if (v === 'Look at') { await sayK('Lou\'s key ring. The closet key is on there, right next to Lou. Who is watching me.'); return true; }
+        if (v === 'Pick up' || v === 'Use') {
+          if (!F.louAway) { await say('lou', 'Touch those keys, kid, and you\'ll be caddying for Dr. Beeper for a month.'); await sayK('(Gulp. I need to get Lou away from his desk somehow.)'); return true; }
+          F.gotKeys = 1; giveItem('keys'); await sayK('Lou\'s still yelling into the back-office phone. Heh.'); return true;
+        }
+      } },
+    { name: 'Desk', x: 486, y: 202, w: 114, h: 38, front: true,
+      draw() { R(486, 202, 114, 6, '#3b2614'); R(490, 208, 106, 32, '#6b4a2a'); R(496, 212, 94, 12, '#5c3f22'); R(496, 226, 94, 12, '#5c3f22'); R(538, 217, 10, 3, '#d4af37'); R(538, 231, 10, 3, '#d4af37'); R(566, 192, 22, 10, '#111'); R(562, 198, 30, 5, '#222'); R(500, 196, 30, 6, '#f4f1e0'); R(504, 194, 24, 3, '#ffe066'); },
+      async act(v) {
+        if (v === 'Look at') { await sayK('Lou\'s desk: racing forms, betting slips, and a sandwich from the Ford administration.'); return true; }
+        if (v === 'Open') { await sayK(F.louAway ? 'Racing forms. A lot of them. I don\'t want to know.' : 'With Lou sitting right there? Not a chance.'); return true; }
+      } },
+    { name: 'Phone', x: 560, y: 190, w: 30, h: 14,
+      async act(v) {
+        if (v === 'Look at') { await sayK('Lou\'s phone. Line one\'s always busy. Line two rings in his back office, and he runs for it like it\'s the Kentucky Derby.'); return true; }
+        if (v === 'Use' || v === 'Pick up') { await sayK(F.louAway ? 'Better not. Lou\'s on the other end yelling "HELLO?"' : 'Lou\'s using it. For "business."'); return true; }
+      } },
+    { name: 'Office Door', x: 602, y: 98, w: 36, h: 142,
+      draw() { R(600, 94, 40, 146, '#2e1e10'); R(606, 100, 34, 140, '#7b5530'); R(610, 110, 28, 12, '#f4f1e0'); txt('OFC', 624, 112, '#222', 8, 'center', null); R(610, 168, 5, 6, '#d4af37'); },
+      async act(v) {
+        if (v === 'Open' || v === 'Look at') { await sayK(F.louAway ? 'I can hear Lou in there: "HELLO? Who IS this? Beeper, is that you?"' : 'Lou\'s back office. The second phone line lives in there.'); return true; }
+      } },
+    { actor: 'lou', name: 'Lou Loomis', show: () => !F.louAway,
+      async act(v, it) {
+        if (v === 'Talk to') {
+          if (G.stage === 0) {
+            const c = await choose('Ask Lou about...', ['The blood', 'Borrowing the closet key', 'The caddy scholarship', 'Never mind'], 3);
+            if (c === 0) { await say('lou', 'Tony bled on my floor. You clean my floor. It\'s the circle of life, kid.'); await sayK('Could I use the mop?'); await say('lou', 'Mop\'s in the closet. Closet\'s locked. Key\'s on my ring. Ring stays on that hook where I can see it.'); }
+            if (c === 1) { await sayK('Could I borrow the closet key?'); await say('lou', 'Can\'t you see I\'m on the phone? Line one\'s been busy since 1971.'); await say('lou', '(into phone) Pinky, put me down for twenty on the Judge. To shank one. He always shanks one.'); }
+            if (c === 2) { await say('lou', 'The scholarship? Five holes, Judge Smails runs it. Shoot 24 or better and you\'re college material.'); await say('lou', 'Shoot worse and you\'re caddy material. For life. Like me.'); }
+            return true;
+          }
+          await say('lou', pick(['Get out on that course, Kowalski!', 'You still here? Loop, kid. Loop!', 'Tip money\'s out there, not in here.', 'I got twenty bucks says you win that tournament. Don\'t make me a liar.']));
+          return true;
+        }
+        if (v === 'Give' && it === 'quarter') { await say('lou', 'A quarter? What am I, a parking meter?'); return true; }
+        if (v === 'Give' && it === 'keys') { await say('lou', 'My keys! Where\'d you... never mind. Keep \'em till you\'re done. Then give \'em back.'); return true; }
+        if (v === 'Pick up') { await sayK('Lou is not something you pick up. Lou is something you survive.'); return true; }
+      } },
+  ],
+  async enter() {
+    if (!F.introLou) {
+      F.introLou = 1;
+      await say('lou', 'Hey! New kid! You Kowalski?');
+      await sayK('Yes sir. Kip Kowalski. I\'m here to loop.');
+      await say('lou', 'You\'ll loop when I say you loop. First... pick up that blood.');
+      await sayK('...Blood?');
+      await say('lou', 'Tony and Motormouth had a difference of opinion about a Pepsi. Mop\'s in the closet.');
+      await sayK('The closet\'s locked.');
+      await say('lou', 'Sure is. Now beat it, I\'m on the phone. (into phone) Yeah, Pinky, I\'m here...');
+      await say('nar', 'TIP: Walk with the arrow keys. Pick a verb with Q / E (or the gamepad bumpers). Choose an item with Tab (or Y). Press Z / Enter (or A) to act on the highlighted thing.');
+      saveGame();
+    }
+  },
+};
+async function cleanBlood() {
+  await say('nar', 'Kip dunks the mop and gets to work. Swish. Swish. Wring. Swish.');
+  SFX.splash(); F.clean = 1; takeItem('mop'); takeItem('water');
+  await sayK('Squeaky clean. Well... squeaky pink. Close enough.');
+  if (F.louAway) {
+    F.louAway = 0; const a = actor('lou'); a.x = 630; SFX.door();
+    await moveActor('lou', 540); a.face = -1;
+    await say('lou', 'Some joker keeps calling my office and breathing heavy. Probably Dr. Beeper.');
+    await say('lou', '...Hey. My floor. It\'s clean.');
+    if (has('keys')) { await say('lou', 'And those are MY keys in your pocket, kid.'); await sayK('I was just, uh, holding them for you, Mr. Loomis.'); takeItem('keys'); F.gotKeys = 0; }
+    await say('lou', 'Alright, alright. You got hustle, Kowalski. I like hustle.');
+  }
+  await say('lou', 'Judge Smails needs a caddy on the 9th. He\'s cheap, he\'s mean, and he tips like it\'s 1929.');
+  await say('lou', 'Go. And don\'t embarrass the caddyshack.');
+  G.stage = 1; saveGame();
+  await judgeHole();
+}
+async function judgeHole() {
+  const r = await playGolf('judge', { pre: async () => {
+    await say('smails', 'You\'re the new caddy? Kowalski. Hmph.');
+    await say('smails', 'My back is acting up. You will strike the ball, and I will take the credit. It is a common arrangement among the better sort of people.');
+    await say('nar', 'GOLF TIP: Left/Right aims, Up/Down changes club. Press Z (A) once to start the swing, again to set POWER, and a third time when the marker returns to the yellow line for ACCURACY. Red triangle = the pin distance.');
+    await say('smails', 'Par is four. Do not disappoint me.');
+  } });
+  const d = r.strokes - 4, tip = d <= -1 ? 25 : d === 0 ? 15 : d === 1 ? 8 : 5;
+  await say('smails', d <= 0 ? 'Hmm. Well played. By me, officially. Here is your gratuity.' : 'A disappointing hole. Nevertheless, here is your gratuity.');
+  if (tip <= 8) await say('smails', 'Don\'t spend it all in one place.');
+  addMoney(tip);
+  G.stage = 2; saveGame();
+  await say('nar', 'Back at the caddy yard, word is going around: Ty Webb hit his ball into Carl the groundskeeper\'s shed. Walk right from the caddy yard to reach the rest of Bushwood.');
+  await goRoom('caddyyard', 520, -1);
+}
+
+// ---------------- CADDY YARD ----------------
+ROOMS.caddyyard = {
+  name: 'CADDY YARD', minX: 60, maxX: 610,
+  actors: [{ id: 'tony', x: 356, face: -1 }],
+  draw() {
+    sky(); cloud(260, 40); cloud(470, 26);
+    R(560, 20, 22, 22, '#fff3a0');
+    R(0, 120, W, 40, '#5aa04a');
+    R(380, 92, 170, 50, '#f4efe2'); R(372, 82, 186, 12, '#b0413e'); for (let x = 392; x < 540; x += 22) R(x, 104, 12, 16, '#3a5a8a'); R(455, 60, 20, 24, '#f4efe2'); R(452, 54, 26, 8, '#b0413e');
+    bush(250, 128, 100); bush(560, 126, 80);
+    R(0, 150, W, 112, '#4f9a3c'); R(0, 206, W, 56, '#c8b48a');
+    for (let i = 0; i < 70; i++) R(hash2(i, 1) * W, 208 + hash2(i, 2) * 50, 3, 2, '#b09a70');
+    // shack
+    R(0, 22, 222, 14, '#5a3a22'); R(0, 34, 212, 172, '#8a6a45');
+    for (let y = 44; y < 206; y += 10) R(0, y, 212, 2, '#6f5334');
+    R(36, 42, 150, 24, '#2e5e2a'); txt('CADDYSHACK', 111, 50, '#ffe066', 8, 'center', null);
+    // bench + bag rack
+    R(300, 198, 112, 7, '#8a5a2b'); R(306, 205, 5, 14, '#5a3a1a'); R(400, 205, 5, 14, '#5a3a1a');
+    R(430, 150, 96, 6, '#555');
+    [['#c0392b', 436], ['#2e5e9a', 458], ['#f0c419', 480], ['#1f8a45', 502]].forEach(([c, x]) => { R(x, 156, 16, 50, c); R(x + 2, 146, 3, 12, '#ccc'); R(x + 8, 142, 3, 16, '#ccc'); R(x + 1, 142, 5, 4, '#888'); R(x + 7, 138, 5, 4, '#888'); });
+  },
+  spots: [
+    { name: 'Caddyshack Door', x: 62, y: 112, w: 52, h: 94, exit: true, look: 'The caddyshack. Home of Lou, lost causes, and loose change.',
+      draw() { R(58, 108, 60, 98, '#3b2614'); R(64, 114, 48, 92, '#7b5530'); R(104, 160, 5, 6, '#d4af37'); },
+      go: () => goRoom('caddyshack', 70, 1) },
+    { name: 'Hose', x: 136, y: 150, w: 44, h: 56,
+      draw() { R(150, 150, 10, 6, '#999'); R(154, 146, 3, 5, '#c0392b'); for (let i = 0; i < 3; i++) { ctx.strokeStyle = '#2e8b3a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.ellipse(156, 184, 16 - i * 4, 12 - i * 3, 0, 0, 7); ctx.stroke(); } R(154, 156, 3, 18, '#2e8b3a'); },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK('A garden hose on a spigot. The only clean water in a hundred feet of the caddyshack.'); return true; }
+        if (v === 'Use' && it === 'bucket') { takeItem('bucket'); SFX.splash(); await say('nar', 'Kip fills the bucket to the brim.'); giveItem('water'); return true; }
+        if (v === 'Use' && it === 'water') { await sayK('It\'s already full.'); return true; }
+        if (v === 'Use' && !it) { await sayK('I\'d get soaked. ...Honestly, in this heat, tempting. But no.'); return true; }
+        if (v === 'Pick up') { await sayK('Lou would notice his hose was gone. Lou notices everything that isn\'t his floor.'); return true; }
+      } },
+    { name: 'Pay Phone', x: 246, y: 108, w: 38, h: 98,
+      draw() { R(262, 150, 6, 56, '#666'); R(248, 110, 34, 44, '#9aa0a6'); R(252, 116, 7, 22, '#222'); R(263, 118, 14, 16, '#ccc'); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) R(264 + i * 4, 119 + j * 5, 3, 3, '#555'); R(250, 100, 30, 10, '#2e5e9a'); txt('TEL', 265, 102, '#fff', 8, 'center', null); },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK('A pay phone. Somebody scratched a number into it: "LOU\'S OFFICE — CALL FOR A GOOD TIME." It\'s the caddyshack\'s back line.'); return true; }
+        if ((v === 'Use' || v === 'Give') && it === 'quarter') {
+          if (F.louAway) { await sayK('One prank call a day. That\'s the rule.'); return true; }
+          takeItem('quarter');
+          await say('nar', 'Kip drops in the quarter and dials the number scratched on the phone...');
+          SFX.ring(); await wait(1.5);
+          await say('nar', 'Inside the caddyshack, the phone in Lou\'s back office starts ringing.');
+          await say('lou', '(from inside) Hold on, Pinky, it\'s the other line! ...HELLO? HELLO?? WHO IS THIS?');
+          F.louAway = 1;
+          await sayK('(breathing heavily into the receiver) ...That should keep him busy for a while.');
+          return true;
+        }
+        if (v === 'Use' || v === 'Pick up') { await sayK('It needs a coin. Pay phone. "Pay" being the key word.'); return true; }
+      } },
+    { actor: 'tony', name: "Tony D'Annunzio",
+      async act(v, it) {
+        if (v === 'Talk to') {
+          const lines = {
+            0: [['tony', 'Don\'t look at me. I\'m leakin\'.'], ['tony', 'Motormouth threw a Pepsi. I threw a punch. The Pepsi won.'], ['tony', 'Pro tip, new kid: Lou\'s got a second phone line in his back office. When it rings, he runs for it like it\'s the Kentucky Derby.'], ['tony', 'The number\'s scratched on the pay phone. Everybody knows it. Nobody\'s got a quarter.']],
+            2: [['tony', 'Carl\'s shed is way out by the maintenance road. Knock first. Carl\'s got... projects.']],
+            3: [['tony', 'The pool? Caddies only swim on Caddy Day. And nobody talks about what happened LAST Caddy Day.']],
+            4: [['tony', 'Czervik? That guy tipped me a hundred bucks and a bowling ball. I don\'t even bowl.']],
+            5: [['tony', 'You need the Judge to sponsor you? Good luck. Smails likes caddies like he likes gophers.']],
+            6: [['tony', 'See you at the tournament, Kowalski. I\'m shooting 25. Easy. Beat THAT.']],
+          };
+          for (const [w, t] of (lines[G.stage] || lines[6])) await say(w, t);
+          return true;
+        }
+        if (v === 'Give' && it) { await say('tony', 'I\'m bleedin\' here, not shopping.'); return true; }
+      } },
+    { name: 'Golf Bags', x: 430, y: 136, w: 96, h: 70, look: 'Members\' bags, lined up and waiting. Somewhere in there is my tuition.',
+      async act(v) { if (v === 'Pick up') { await sayK('Not until Lou gives me a loop. Taking a bag without a loop is how caddies disappear.'); return true; } } },
+    { name: 'Path to the Course', x: 590, y: 130, w: 50, h: 90, exit: true, look: 'The path out to the rest of Bushwood.',
+      draw() { R(606, 150, 4, 60, '#6b4a2a'); R(572, 136, 66, 18, '#e8dcc0'); txt('COURSE', 603, 141, '#2e5e2a', 8, 'center', null); },
+      async go() { if (G.stage < 2) { await sayK('Lou will skin me if I leave before I pick up that blood.'); return; } await openMap(); } },
+  ],
+};
+
+// ---------------- CARL'S SHED ----------------
+ROOMS.shed = {
+  name: "CARL'S SHED", minX: 40, maxX: 590,
+  actors: [{ id: 'ty', x: 430, face: -1 }, { id: 'carl', x: 560, face: -1 }],
+  draw() {
+    planks(0, 0, W, 200, '#4a3520', 24);
+    R(0, 0, W, 16, '#2a1d10'); R(0, 40, W, 6, '#3a2816');
+    R(0, 196, W, 66, '#5e4630'); for (let i = 0; i < 60; i++) R(hash2(i, 9) * W, 200 + hash2(i, 3) * 60, 4, 2, '#4e3a24');
+    // shelves
+    R(146, 78, 128, 5, '#6b4a2a'); R(146, 120, 128, 5, '#6b4a2a');
+    [[152, '#2e5e9a'], [168, '#c0392b'], [186, '#f0c419'], [204, '#2e8b3a']].forEach(([x, c]) => R(x, 64, 12, 14, c));
+    R(152, 104, 14, 16, '#888'); R(172, 110, 20, 10, '#6b3e1f'); R(250, 104, 16, 16, '#eee');
+    // poster
+    R(40, 60, 50, 64, '#e8dcc0'); drawGopher(65, 118, 2); R(40, 60, 50, 64, 'rgba(0,0,0,0)'); txt('WANTED', 65, 64, '#c0392b', 8, 'center', null);
+    ctx.strokeStyle = '#c0392b'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(44, 78); ctx.lineTo(86, 120); ctx.moveTo(86, 78); ctx.lineTo(44, 120); ctx.stroke();
+    if (F.trap) { R(352, 234, 40, 4, '#555'); R(356, 228, 32, 6, '#777'); }
+  },
+  spots: [
+    { name: 'Door', x: 4, y: 100, w: 40, h: 140, exit: true, look: 'Back out to the grounds.',
+      draw() { R(0, 96, 46, 144, '#2a1d10'); R(4, 100, 38, 140, '#9fc5e8'); R(4, 196, 38, 44, '#5aa04a'); },
+      go: () => openMap() },
+    { name: 'Window', x: 326, y: 62, w: 82, h: 72,
+      draw() {
+        R(326, 62, 82, 72, '#2a1d10');
+        if (F.win) { R(332, 68, 70, 60, '#bfe9ff'); R(332, 108, 70, 20, '#5aa04a'); R(360, 96, 2, 14, '#fff'); R(362, 96, 6, 4, '#e53935'); R(332, 60, 70, 10, '#6f7a5a'); }
+        else { R(332, 68, 70, 60, '#6f7a5a'); R(332, 97, 70, 3, '#2a1d10'); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(332, 68); ctx.lineTo(352, 88); ctx.moveTo(340, 68); ctx.lineTo(332, 80); ctx.stroke(); }
+      },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK(F.win ? 'Wide open. I can see a green out there. A clear shot, if you\'re a lunatic.' : 'Painted shut. Carl says it hasn\'t opened since Korea. The hinges are rusted solid.'); return true; }
+        if (v === 'Open') { if (F.win) { await sayK('Already open.'); return true; } SFX.no(); await sayK('Nnnngh! Stuck. Those rusty hinges need some grease.'); return true; }
+        if (v === 'Use' && it === 'oil') {
+          if (F.win) { await sayK('It\'s open already. It doesn\'t need more oil. Nothing in here needs more oil.'); return true; }
+          takeItem('oil'); F.win = 1; SFX.door();
+          await say('nar', 'Squirt. Squirt. Squeak... squeeeak... KA-CHUNK! The window swings open. Daylight floods the shed.');
+          await say('carl', 'Well, I\'ll be. Fresh air. I don\'t care for it.');
+          await tyCheck(); return true;
+        }
+      } },
+    { name: 'Oil Can', x: 226, y: 100, w: 18, h: 20, show: () => !F.gotOil,
+      draw() { R(228, 106, 14, 14, '#c0392b'); R(230, 109, 10, 4, '#f1c40f'); R(234, 100, 3, 6, '#999'); R(236, 99, 10, 2, '#999'); },
+      async act(v) {
+        if (v === 'Pick up') { F.gotOil = 1; giveItem('oil'); await say('carl', 'Hey, that\'s my... eh, go ahead. I got a barrel of it.'); return true; }
+        if (v === 'Look at') { await sayK('An oil can. "FOR MACHINES AND ALSO CARL."'); return true; }
+      } },
+    { name: 'Rake', x: 104, y: 108, w: 26, h: 132, show: () => !F.gotRake,
+      draw() { ctx.strokeStyle = '#b98a4a'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(126, 236); ctx.lineTo(112, 118); ctx.stroke(); R(100, 108, 26, 5, '#777'); for (let i = 0; i < 6; i++) R(101 + i * 4, 113, 2, 7, '#777'); },
+      async act(v) {
+        if (v === 'Pick up') { F.gotRake = 1; giveItem('rake'); await say('carl', 'Take it. I got six rakes. Seven if you count the one in the pond.'); return true; }
+        if (v === 'Look at') { await sayK('A rake. For bunkers, leaves, and apparently fertilizer.'); return true; }
+      } },
+    { name: 'Fertilizer Pile', x: 184, y: 196, w: 112, h: 44,
+      draw() {
+        ctx.fillStyle = '#5a3a1a'; ctx.beginPath(); ctx.ellipse(240, 240, 56, 30, 0, Math.PI, 0); ctx.fill();
+        ctx.fillStyle = '#6e4a24'; ctx.beginPath(); ctx.ellipse(232, 240, 36, 20, 0, Math.PI, 0); ctx.fill();
+        R(270, 206, 30, 34, '#d8cfa0'); txt('FERT', 285, 216, '#5a3a1a', 8, 'center', null);
+        if (F.ball) { R(238, 216, 5, 5, '#fff'); }
+      },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK(F.ball ? 'Ty\'s ball is perched on top. It looks... content.' : 'Carl\'s special-blend fertilizer. It\'s warm. Why is it warm? Ty\'s ball is in there somewhere.'); return true; }
+        if (v === 'Pick up' || v === 'Open') { await sayK('With my BARE HANDS? I need a tool.'); return true; }
+        if (v === 'Use' && it === 'rake') {
+          if (F.ball) { await sayK('Nothing else in there I want to find.'); return true; }
+          F.ball = 1; SFX.sand();
+          await say('nar', 'Kip rakes through the pile. Rake. Rake. Rake... there! A golf ball, sitting pretty on top of the heap.');
+          await say('ty', 'Leave it there. I\'ll play it as it lies. It\'s where it wants to be.');
+          await tyCheck(); return true;
+        }
+      } },
+    { name: 'Bear Trap', x: 344, y: 222, w: 56, h: 18, show: () => !F.trap,
+      draw() { R(352, 234, 40, 4, '#555'); for (let i = 0; i < 6; i++) { R(350 + i * 7, 222, 3, 12, '#888'); } R(346, 232, 52, 3, '#777'); R(366, 230, 12, 4, '#c0392b'); },
+      async act(v, it) {
+        if (v === 'Look at') { await sayK('A bear trap, right under the window. For a gopher. That\'s like hunting a mosquito with a bazooka.'); return true; }
+        if (v === 'Pick up') { await sayK('I\'d like to keep all ten fingers. Maybe I could set it off with something long.'); return true; }
+        if (v === 'Use' && it === 'rake') {
+          F.trap = 1; SFX.thwack();
+          await say('nar', 'Kip pokes the trap with the rake. SNAP!! The rake is now slightly shorter.');
+          await say('carl', 'Aw, I just set that! ...Eh. I got nine more.');
+          await tyCheck(); return true;
+        }
+      } },
+    { name: 'Hybrid Grass', x: 480, y: 160, w: 40, h: 80,
+      draw() { R(486, 214, 28, 26, '#b0413e'); R(484, 210, 32, 6, '#8a2f2c'); for (let i = 0; i < 9; i++) { ctx.strokeStyle = i % 2 ? '#3fa34d' : '#2e8b3a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(490 + i * 2.5, 212); ctx.lineTo(480 + i * 5, 162 + (i % 3) * 8); ctx.stroke(); } },
+      async act(v) {
+        if (v === 'Look at') { await sayK('Carl\'s "hybrid" grass. He says you can play 36 holes on it. He won\'t say what it\'s crossed with. He just giggles.'); return true; }
+        if (v === 'Pick up' || v === 'Use') { await say('carl', 'HANDS OFF the hybrid, kid.'); return true; }
+      } },
+    { name: 'Crates', x: 592, y: 170, w: 48, h: 70,
+      draw() { R(594, 176, 46, 30, '#9a7a3a'); R(594, 208, 46, 32, '#8a6a2a'); txt('TNT', 617, 186, '#c0392b', 8, 'center', null); txt('KA', 617, 219, '#c0392b', 8, 'center', null); },
+      look: 'Crates stamped "PLASTIC EXPLOSIVE — GOPHER USE ONLY." That\'s not as reassuring as Carl thinks.',
+      async act(v) { if (v === 'Open' || v === 'Pick up') { await say('carl', 'Nobody touches the crates. Those are for the endgame.'); return true; } } },
+    { actor: 'ty', name: 'Ty Webb',
+      async act(v, it) {
+        if (v === 'Talk to') {
+          if (!F.shedDone) {
+            if (F.ball && F.win && F.trap) { await playThrough(); return true; }
+            await say('ty', pick(['Hi. I\'m Ty. I\'m playing through.', 'Nice shed. Very... fragrant.']));
+            if (!F.ball) await say('ty', 'My ball\'s somewhere in that fertilizer. I\'d rake it out, but I\'m wearing white.');
+            if (!F.win) await say('ty', 'The window\'s my way out. It\'s stuck, though. Everything\'s stuck in here.');
+            if (!F.trap) await say('ty', 'And there\'s a bear trap right where I\'d be standing. Zen only goes so far.');
+            return true;
+          }
+          if (!F.btb) { const c = await choose('Ty: "Still up for that blindfolded putting wager? Twenty bucks."', ['You\'re on', 'Not now'], 1); if (c === 0) { await beTheBall(); await goRoom('shed', 380, 1); } return true; }
+          await say('ty', pick(['Nice day. Shame to waste it working.', 'Win that tournament, kid. College is great. I went to four of them.', 'See your future. Be your future. Make it... make your future.']));
+          return true;
+        }
+        if (v === 'Give' && it) { await say('ty', 'I don\'t need things. Things need me. Keep it.'); return true; }
+      } },
+    { actor: 'carl', name: 'Carl',
+      async act(v, it) {
+        if (v === 'Give' && it === 'hose' || (v === 'Talk to' && has('hose'))) { await giveHose(); return true; }
+        if (v === 'Talk to') {
+          if (G.stage === 2) {
+            const c = await choose('Ask Carl about...', ['Ty\'s ball', 'The window', 'The gopher', 'Nothing'], 3);
+            if (c === 0) await say('carl', 'Came in the door and landed in my fertilizer. Rake it out. Rakes are over there. I got six.');
+            if (c === 1) await say('carl', 'Ain\'t opened since Korea. Rusted solid. Needs grease. Oil can\'s on the shelf.');
+            if (c === 2) { await say('carl', 'That gopher\'s been tearing up my greens three summers running. We got history, him and me.'); await say('carl', 'He\'s a varmint. A crafty, smart-mouthed varmint.'); }
+            return true;
+          }
+          if (G.stage === 3) {
+            if (F.hoseGiven) { const c = await choose('Carl: "Ready to go varmint huntin\' again?"', ['Let\'s go', 'Not yet'], 1); if (c === 0) await gopherHunt(); return true; }
+            await say('carl', 'Get me that pump hose from the pool. The lifeguard guards it like Fort Knox. You gotta clear that pool somehow.'); return true;
+          }
+          await say('carl', pick(['Cinderella story. Outta nowhere. A former caddy, about to win the whole thing. Heh heh.', 'That gopher\'s still out there. I can hear him laughin\'.', 'You go get \'em in that tournament, kid. Just keep your head down. And your follow-through up.']));
+          return true;
+        }
+        if (v === 'Give' && it) { await say('carl', 'What am I supposed to do with that? Unless it explodes. Does it explode?'); return true; }
+      } },
+  ],
+  async enter() {
+    if (!F.shedIntro) {
+      F.shedIntro = 1;
+      await say('carl', 'Well, well. A caddy. In my shed. Wipe your feet. Actually, don\'t. Makes no difference in here.');
+      await say('ty', 'Hi. My tee shot came in through the door. It\'s somewhere in that pile.');
+      await sayK('Mr. Webb, you could just take a drop.');
+      await say('ty', 'I could. But then I\'d be a guy who took a drop. I\'ll play through. Out the window.');
+      await say('ty', 'Find my ball, open that window, and deal with the bear trap. Then you can hit it. I\'m feeling generous. And lazy.');
+      await say('carl', 'Watch the trap. It\'s for the gopher. Mostly.');
+      saveGame();
+    }
+    if (F.shedDone && G.stage === 2) await carlGopherIntro();
+  },
+};
+async function tyCheck() {
+  if (F.ball && F.win && F.trap && !F.shedDone) await say('ty', 'Looks like the path is clear. Talk to me when you\'re ready to play through.');
+}
+async function playThrough() {
+  const r = await playGolf('shed', { pre: async () => {
+    await say('ty', 'Here\'s the situation. Ball\'s on the pile. Window\'s open. Green\'s out there.');
+    await say('ty', 'Keep it low, there\'s a roof. Get it on the green within three shots and I\'ll putt out. Don\'t think about the walls.');
+  } });
+  if (r.success) {
+    F.shedDone = 1;
+    await say('ty', 'Nice.');
+    await say('nar', 'Ty strolls out the door and taps the ball in without looking at it.');
+    await say('ty', 'Here. Ten bucks. Caddying is like life, except you get paid.');
+    addMoney(10);
+    const c = await choose('Ty: "Care for a little wager? Blindfolded putting. Twenty bucks."', ['You\'re on', 'Maybe later'], 1);
+    if (c === 0) await beTheBall();
+    await goRoom('shed', 380, 1);
+    await carlGopherIntro();
+  } else {
+    await say('ty', 'Hm. The ball doesn\'t know it failed. Let\'s go again. Talk to me when you\'re ready.');
+    await goRoom('shed', 380, 1);
+  }
+}
+async function beTheBall() {
+  const r = await playGolf('blind', { pre: async () => {
+    await say('ty', 'Three putts. You get a peek at the green, then I cover your eyes.');
+    await say('ty', 'Sink it or finish within a yard and a half. Two good ones and I pay you twenty. Watch the slope arrows while you can.');
+    await say('ty', 'Don\'t aim. Don\'t think. Be the ball.');
+  } });
+  if (r.success) { await say('ty', 'Nice. You were the ball.'); addMoney(20); F.btb = 1; }
+  else await say('ty', 'You weren\'t the ball. You were more like... the rake. Ask me again anytime.');
+}
+async function carlGopherIntro() {
+  if (G.stage !== 2) return;
+  G.stage = 3; saveGame();
+  await say('carl', 'Say, kid. You got a good arm. I got a gopher problem.');
+  await say('carl', 'I wanna flood his tunnels and bonk him when he pops up. For that I need the big pump hose from the pool.');
+  await say('carl', 'Lifeguard won\'t let me near it since... the incident.');
+  await sayK('What incident?');
+  await say('carl', 'Nobody knows. That\'s what makes it an incident. The pool\'s on the map now.');
+}
+async function giveHose() {
+  if (!has('hose')) return;
+  takeItem('hose'); F.hoseGiven = 1;
+  await say('carl', 'Now THAT\'S a hose. Forty feet of blue revenge. Heh heh heh.');
+  await say('carl', 'Alright. Let\'s go varmint huntin\'.');
+  await gopherHunt();
+}
+async function gopherHunt() {
+  const r = await playGolf('gopher', { pre: async () => {
+    await say('carl', 'Tunnels are flooded. He\'s gonna pop up outta one of those holes madder than a wet cat.');
+    await say('carl', 'When he pops up, you bonk him with a golf ball. Land it near him or roll it into him. Three bonks, eight balls. Go.');
+  } });
+  if (r.success) {
+    await say('carl', 'Ha HA! Three bonks! He\'s... he\'s dancin\'. Why is he dancin\'?');
+    await say('carl', 'He\'s mockin\' me. That\'s fine. This ain\'t over, varmint. This means war.');
+    await say('carl', 'Here, kid. Twenty bucks. Found it in a ball washer.');
+    addMoney(20); F.gopherDone = 1; G.stage = 4; saveGame();
+    await say('carl', 'Oh, and some loudmouth in a purple jacket was looking for a caddy. Czervik. He\'s up at the First Tee.');
+  } else await say('carl', 'He got away! That varmint... Talk to me when you wanna go again.');
+  await goRoom('shed', 380, 1);
+}
+
+// ---------------- POOL ----------------
+ROOMS.pool = {
+  name: 'POOL', minX: 40, maxX: 610,
+  actors: [{ id: 'vendor', x: 80, face: 1 }, { id: 'guard', x: 514, y: 112, face: -1, show: () => !F.poolClear }],
+  draw() {
+    sky('#7ec6f0', '#b6e2f7', 130); cloud(190, 30); cloud(420, 50);
+    R(0, 110, W, 40, '#2f6b2a'); for (let x = 0; x < W; x += 26) R(x + 6, 102, 16, 12, '#3a7d33');
+    R(0, 146, W, 116, '#e0d6bd');
+    for (let x = 0; x < W; x += 40) R(x, 146, 1, 116, '#d0c6ad');
+    R(166, 146, 308, 56, '#eeeeee'); R(172, 150, 296, 48, '#4aa3e0');
+    const tt = performance.now() / 1000;
+    for (let i = 0; i < 8; i++) R(180 + ((i * 47 + tt * 10) % 280), 156 + (i % 4) * 11, 14, 2, '#8fd0f5');
+    const panic = F.poolPanicT ? (performance.now() - F.poolPanicT) / 1000 : -1;
+    if (!F.poolClear || (panic >= 0 && panic < 1.5)) {
+      const heads = [[200, '#f3caa0', '#e53935'], [240, '#d9a579', '#ffe066'], [300, '#f3caa0', '#7a4a1a'], [352, '#e9b98f', '#2e5e9a'], [410, '#f0c8a8', '#ff77aa'], [440, '#d69565', '#ffffff']];
+      heads.forEach(([x, sk, cap], i) => {
+        const bob = Math.sin(tt * 3 + i) * 2, flee = panic > 0 ? panic * 120 * (i % 2 ? 1 : -1) : 0, up = panic > 0 ? -panic * 40 : 0;
+        R(x + flee - 6, 166 + bob + up, 12, 12, sk); R(x + flee - 6, 164 + bob + up, 12, 5, cap); R(x + flee - 2, 170 + bob + up, 2, 2, '#000');
+      });
+    }
+    if (F.poolClear) { R(316, 170, 18, 5, '#6b3e1f'); R(318, 169, 14, 2, '#7d4a26'); }
+    // snack hut
+    R(8, 70, 150, 170, '#f4e8c8'); for (let x = 8; x < 158; x += 20) R(x, 62, 10, 22, '#d62828'), R(x + 10, 62, 10, 22, '#fff');
+    R(18, 94, 130, 40, '#2a2a2a'); txt('SNACKS', 83, 98, '#ffe066', 8, 'center', null); txt('CANDY $1', 83, 110, '#fff', 8, 'center', null); txt('HOT DOG $2', 83, 121, '#fff', 8, 'center', null);
+    // lifeguard chair
+    R(496, 112, 5, 128, '#fff'); R(530, 112, 5, 128, '#fff'); for (let y = 140; y < 236; y += 18) R(496, y, 39, 3, '#ddd'); R(490, 110, 52, 6, '#fff'); R(490, 80, 4, 32, '#fff');
+  },
+  drawFront() { R(8, 176, 150, 64, '#c0392b'); R(8, 174, 150, 6, '#8a2f2c'); R(20, 190, 126, 3, '#e57373'); },
+  spots: [
+    { name: 'Gate', x: 606, y: 120, w: 34, h: 120, exit: true, look: 'The gate back to the grounds.', draw() { R(610, 130, 4, 110, '#888'); R(636, 130, 4, 110, '#888'); for (let y = 140; y < 240; y += 12) R(610, y, 30, 2, '#aaa'); }, go: () => openMap() },
+    { name: 'Swimming Pool', x: 170, y: 148, w: 300, h: 52,
+      async act(v, it) {
+        if (v === 'Look at') { await sayK(F.poolClear ? 'Deserted. Just a candy bar, floating in the middle, like a tiny brown iceberg.' : 'Packed with members. And Spaulding Smails, doing cannonballs directly onto old ladies.'); return true; }
+        if ((v === 'Use' || v === 'Give') && it === 'candy') { await doodyGag(); return true; }
+        if ((v === 'Use' || v === 'Give') && it === 'hotdog') { await sayK('A floating hot dog is just lunch for Spaulding.'); return true; }
+        if (v === 'Use' && !it) { await say('guard', F.poolClear ? '(from far away) NOBODY GOES IN THAT POOL!' : 'Members only, caddy! Caddy Day is Monday!'); return true; }
+      } },
+    { name: 'Spaulding', x: 290, y: 160, w: 24, h: 24, show: () => !F.poolClear,
+      async act(v) {
+        if (v === 'Talk to') { await say('spaulding', 'Hey caddy! I want a hamburger! No... a cheeseburger! Go get it!'); await sayK('I don\'t work the grill, Spaulding.'); await say('spaulding', 'My grandpa\'s a JUDGE. I\'ll have you arrested! For... being a caddy!'); return true; }
+        if (v === 'Look at') { await sayK('Spaulding Smails. The Judge\'s grandson. A spoiled brat in water wings.'); return true; }
+      } },
+    { name: 'Pump Hose', x: 548, y: 196, w: 50, h: 44, show: () => !F.gotHose,
+      draw() { R(552, 204, 42, 36, '#8a9096'); R(556, 208, 34, 10, '#5a6066'); for (let i = 0; i < 3; i++) { ctx.strokeStyle = '#2e7bd6'; ctx.lineWidth = 4; ctx.beginPath(); ctx.ellipse(573, 228, 18 - i * 5, 8 - i * 2, 0, 0, 7); ctx.stroke(); } },
+      async act(v) {
+        if (v === 'Look at') { await sayK('The pool\'s big pump hose. Exactly what Carl needs to flood a gopher.'); return true; }
+        if (v === 'Pick up') {
+          if (!F.poolClear) { SFX.whistle(); await say('guard', 'HEY! Hands off the pump, caddy! Club property! Nobody touches that unless the pool is EMPTY.'); await sayK('(And this pool is never empty. Unless... something cleared everybody out.)'); return true; }
+          F.gotHose = 1; giveItem('hose'); await sayK('Nobody\'s watching. Nobody\'s even within a hundred yards.'); return true;
+        }
+      } },
+    { actor: 'vendor', name: 'Snack Bar Guy',
+      async act(v, it) {
+        if (v === 'Talk to') {
+          await say('vendor', 'What\'ll it be, caddy?');
+          const c = await choose('Snack Bar  (you have $' + G.money + ')', ['Candy bar ($1)', 'Hot dog ($2)', 'Iced tea ($1)', 'Nothing'], 3);
+          if (c === 0) await buy('candy', 1);
+          if (c === 1) await buy('hotdog', 2);
+          if (c === 2) { if (G.money >= 1) addMoney(-1); await say('nar', 'Kip gulps down an iced tea. Ahhh. Refreshing. Now back to work.'); }
+          return true;
+        }
+        if (v === 'Give' && it) { await say('vendor', 'No returns, kid.'); return true; }
+      } },
+    { actor: 'guard', name: 'Lifeguard', show: () => !F.poolClear,
+      async act(v, it) {
+        if (v === 'Talk to') {
+          await say('guard', 'Members only, caddy. Caddy Day is Monday. Today\'s not Monday.');
+          await sayK('What about that pump hose?');
+          await say('guard', 'Club property. Nobody touches it while there\'s a single member in this pool. And this pool is ALWAYS full.');
+          await say('guard', 'Only thing that ever cleared it was... never mind. We don\'t talk about the incident.');
+          return true;
+        }
+        if (v === 'Give' && it === 'candy') { await say('guard', 'Chocolate? On duty? I\'m a professional.'); await say('guard', '...Plus, you do NOT want that anywhere near this pool. Trust me.'); return true; }
+        if (v === 'Give' && it) { await say('guard', 'Nice try. I don\'t take bribes. I take tips. Different thing.'); return true; }
+      } },
+  ],
+  async enter() {
+    if (!F.poolIntro) { F.poolIntro = 1; await say('nar', 'The Bushwood pool. Members only. Caddies swim on Caddy Day, which is not today.'); }
+  },
+};
+async function buy(id, price) {
+  if (has(id)) { await say('vendor', 'You already got one. One per customer. Club rules. I just made that up.'); return; }
+  if (G.money < price) { await say('vendor', 'You\'re short, kid... ah, take it. Caddies got it rough.'); giveItem(id); return; }
+  addMoney(-price); giveItem(id);
+}
+async function doodyGag() {
+  if (F.poolClear) { await sayK('Nobody\'s going back in there for a while.'); return; }
+  takeItem('candy');
+  await say('nar', 'Kip unwraps the candy bar and lobs it into the pool. Plop. It bobs to the surface. Brown. Log-shaped. Floating.');
+  await wait(.5);
+  SFX.scream();
+  await say('crowd', 'DOODY!!!');
+  F.poolPanicT = performance.now(); F.poolClear = 1; SFX.whistle();
+  await say('guard', 'EVERYBODY OUT OF THE POOL! CODE BROWN! THIS IS NOT A DRILL!');
+  await wait(1);
+  await sayK('...Well. That escalated quickly.');
+  await say('nar', 'The pool is deserted. The lifeguard has run off to find a net, a hazmat suit, and a new career.');
+  F.poolPanicT = 0;
+}
+
+// ---------------- CLUBHOUSE TERRACE ----------------
+ROOMS.terrace = {
+  name: 'TERRACE', minX: 60, maxX: 600,
+  actors: [{ id: 'smails', x: 160, face: 1 }, { id: 'al', x: 318, face: -1 }, { id: 'lacey', x: 470, face: -1 }],
+  draw() {
+    sky('#7ec6f0', '#bfe6fa', 120);
+    R(400, 110, 240, 90, '#3f7fcf'); R(400, 100, 240, 14, '#2f6b2a'); for (let x = 404; x < 640; x += 30) bush(x, 92, 26, '#2a5f26');
+    const tt = performance.now() / 1000;
+    for (let i = 0; i < 7; i++) R(410 + ((i * 53 + tt * 6) % 220), 124 + (i % 3) * 18, 16, 2, '#6fa6e6');
+    if (!F.gotBaroo && Math.sin(tt * 5) > .3) { R(556, 138, 4, 4, '#fff'); R(554, 140, 8, 1, '#fff'); R(557, 135, 1, 10, '#fff'); }
+    R(0, 0, 400, 200, '#efe6d0'); for (let y = 0; y < 200; y += 14) R(0, y, 400, 1, '#e0d6bd');
+    R(0, 24, 400, 14, '#2e6b3a'); for (let x = 0; x < 400; x += 20) R(x, 38, 16, 5, '#2e6b3a');
+    for (const x of [90, 230, 330]) { R(x, 60, 50, 70, '#34495e'); R(x + 4, 64, 42, 62, '#7fb2d9'); R(x + 24, 64, 2, 62, '#34495e'); }
+    R(0, 196, W, 66, '#b8a88a'); for (let x = 0; x < W; x += 48) R(x, 196, 2, 66, '#a8987a'); for (let y = 214; y < 262; y += 18) R(0, y, W, 1, '#a8987a');
+    R(400, 150, 240, 5, '#fff'); for (let x = 404; x < 640; x += 12) R(x, 155, 4, 41, '#f4f4f4'); R(400, 192, 240, 4, '#ddd');
+    // table + umbrella
+    R(208, 90, 3, 110, '#888'); ctx.fillStyle = '#d62828'; ctx.beginPath(); ctx.moveTo(150, 110); ctx.lineTo(210, 84); ctx.lineTo(270, 110); ctx.fill(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(190, 110); ctx.lineTo(210, 84); ctx.lineTo(230, 110); ctx.fill();
+    R(180, 196, 60, 5, '#ddd'); R(206, 200, 6, 38, '#999'); R(222, 186, 6, 10, '#c9f0ff'); R(223, 184, 4, 2, '#7ab800');
+  },
+  spots: [
+    { name: 'Clubhouse Door', x: 14, y: 96, w: 48, h: 144, exit: true, look: 'Back through the clubhouse to the grounds. Walk fast, look expensive.', draw() { R(12, 92, 52, 148, '#6b4a2a'); R(18, 98, 40, 142, '#8a6a45'); R(50, 168, 4, 6, '#d4af37'); }, go: () => openMap() },
+    { name: 'Pond', x: 410, y: 106, w: 230, h: 44,
+      async act(v, it) {
+        if (v === 'Look at') { await sayK(F.gotBaroo ? 'Just a pond. Carl says it has opinions.' : 'Out in the middle, something shiny glints. That\'s gotta be Billy Baroo.'); return true; }
+        if (F.gotBaroo) return false;
+        if (v === 'Use' && it === 'rake') { await sayK('The rake doesn\'t even come close. Billy Baroo is twenty feet out. I need something that REACHES.'); return true; }
+        if (v === 'Use' && it === 'retriever') {
+          F.gotBaroo = 1; takeItem('retriever');
+          await say('nar', 'The Extend-O-Matic telescopes out... and out... and out. The handle radio crackles to life with a disco hit. Clink! Got it!');
+          giveItem('baroo'); await sayK('Billy Baroo. Slightly damp. Deeply loved.'); return true;
+        }
+        if (v === 'Pick up' || v === 'Use') { await sayK('I\'m not wading in there. Carl says the pond has opinions.'); return true; }
+      } },
+    { actor: 'smails', name: 'Judge Smails',
+      async act(v, it) {
+        if ((v === 'Give' && it === 'baroo') || (v === 'Talk to' && has('baroo'))) { await sponsorship(); return true; }
+        if (v === 'Talk to') {
+          if (G.stage >= 6) { await say('smails', 'The tournament awaits, Kowalski. Do not make me regret this. More than I already do.'); return true; }
+          if (!F.askedSmails) {
+            await say('smails', 'Ah. The caddy. What is it?');
+            await sayK('Judge Smails, sir, I\'d like to enter the Caddy Scholarship Tournament. I need your sponsorship.');
+            await say('smails', 'Out of the question. I am in mourning.');
+            await sayK('Who died?');
+            await say('smails', 'Billy Baroo. My putter. He... slipped out of my hands into that pond after a disagreement about a four-foot putt.');
+            await say('smails', 'Bring me Billy Baroo, and I will consider your little tournament.');
+            F.askedSmails = 1; return true;
+          }
+          await say('smails', 'Billy Baroo is in that pond, boy. He does not enjoy it. Retrieve him.'); return true;
+        }
+        if (v === 'Give' && it) { await say('smails', 'Good heavens, no. I don\'t take things from caddies. Except strokes.'); return true; }
+      } },
+    { actor: 'al', name: 'Al Czervik',
+      async act(v, it) {
+        if (v === 'Give' && it === 'hotdog') {
+          takeItem('hotdog'); F.gaveDog = 1;
+          await say('al', 'A DOG! Kid, you\'re beautiful! Mmmf. Now THAT\'S food. This place serves shrimp the size of a thumbnail.');
+          await say('al', 'Here, take the ball retriever. I got three more in the Rolls. Consider it a tip!');
+          giveItem('retriever'); return true;
+        }
+        if (v === 'Give' && it === 'candy') { await say('al', 'Chocolate? It\'s 95 degrees! I want a DOG, kid. A hot dog!'); return true; }
+        if (v === 'Give' && it) { await say('al', 'What am I, a pawn shop? Wait, I OWN a pawn shop. Still no.'); return true; }
+        if (v === 'Talk to') {
+          if (F.gaveDog) { await say('al', pick(['Keep the retriever, kid! Oh, you used it? Great! Keep the memories!', 'Hey kid, when you win that tournament, I\'m buying this whole club and making you president. Just kidding. Maybe.'])); return true; }
+          await say('al', 'Hey, it\'s my caddy! Look at this bag, kid: AM/FM radio, TV, beer tap, and a telescoping ball retriever. Twenty feet! Fully loaded!');
+          await say('al', 'But I\'m starving. The food here is terrible. You know what this place needs? A hot dog. I\'d trade anything for a hot dog.');
+          return true;
+        }
+      } },
+    { name: "Al's Golf Bag", x: 342, y: 142, w: 32, h: 98,
+      draw() { R(344, 150, 28, 88, '#7b3fa0'); R(344, 150, 28, 6, '#f0c419'); R(344, 200, 28, 4, '#f0c419'); R(348, 162, 20, 16, '#222'); R(350, 164, 16, 12, Math.floor(performance.now() / 300) % 2 ? '#6fa' : '#5c9'); R(366, 120, 1, 30, '#ccc'); R(350, 138, 4, 14, '#ccc'); R(358, 134, 4, 18, '#ccc'); R(349, 134, 6, 5, '#888'); R(357, 130, 6, 5, '#888'); R(346, 186, 8, 8, '#c0c0c0'); },
+      look: 'Al\'s golf bag has a TV, a radio, a beer tap, and possibly a small refrigerator. It hums.',
+      async act(v) {
+        if (v === 'Use') { tone(392, .15, 'square', .05); tone(494, .15, 'square', .05, null, .15); tone(587, .2, 'square', .05, null, .3); await say('nar', 'The bag\'s radio blasts disco across the terrace. Every head turns. Judge Smails\' left eye begins to twitch.'); await say('al', 'Yeah! Now we got a party!'); return true; }
+        if (v === 'Pick up' || v === 'Open') { await say('al', 'Hey, careful! That thing\'s got more wiring than a rocket ship!'); return true; }
+      } },
+    { actor: 'lacey', name: 'Lacey Underall',
+      async act(v, it) {
+        if (v === 'Talk to') {
+          if (!F.laceyTalk) { F.laceyTalk = 1; await say('lacey', 'Hi there. You\'re one of the caddies? I\'m Lacey.'); await sayK('(voice cracks) H-hi. Kip. I\'m Kip. That\'s my name. Kip.'); await say('lacey', 'Cute. If you see Ty Webb, tell him I said hi. Actually... don\'t.'); return true; }
+          await say('lacey', pick(['Good luck in your little tournament, Kip.', 'The Judge is my uncle. Don\'t hold it against me.', 'Is it hot out here, or is it just the terrace?']));
+          return true;
+        }
+        if (v === 'Give' && it) { await say('lacey', 'Aw, sweet. But no thanks.'); return true; }
+      } },
+  ],
+  async enter() {
+    if (!F.terraceIntro) { F.terraceIntro = 1; await say('nar', 'The clubhouse terrace. Martinis, old money, and a view of the pond.'); }
+  },
+};
+async function sponsorship() {
+  takeItem('baroo');
+  await say('smails', 'BILLY! Billy Baroo! Oh, you poor thing, you\'re all wet.');
+  await say('nar', 'The Judge dries the putter with his handkerchief. Tenderly. It\'s uncomfortable to watch.');
+  await say('smails', 'Very well, Kowalski. A deal is a deal. I shall sponsor your entry.');
+  await say('smails', 'Five holes. Par twenty. Last year\'s winner shot twenty-four. Shoot twenty-four or better, and the scholarship is yours.');
+  await say('smails', 'Shoot worse, and you will learn exactly what I think of caddies.');
+  G.stage = 6; saveGame();
+  await say('nar', 'The Caddy Tournament is now open on the map. Practice on the First Tee first if you like.');
+}
+
+// ============================================================
+//  MAIN: title, map, tournament, endings, pause, loop
+// ============================================================
+const CONTROLS = [
+  ['KEYBOARD', ''],
+  ['Walk / aim / menus', 'Arrows or WASD'],
+  ['Act / swing / OK', 'Z, Enter or Space'],
+  ['Back / cancel', 'X, Esc or Backspace'],
+  ['Change verb', 'Q / E  (or 1-6)'],
+  ['Choose item', 'Tab'],
+  ['Examine item / look', 'C'],
+  ['Pause · Mute', 'P · M'],
+  ['GAMEPAD', ''],
+  ['Walk / aim', 'D-pad or left stick'],
+  ['Act / swing · Back', 'A · B'],
+  ['Change verb', 'LB / RB'],
+  ['Choose item · Examine', 'Y · X'],
+  ['Pause · Mute', 'Start · Back'],
+];
+function drawControls() {
+  panel(80, 40, 480, 280, 'rgba(6,14,8,.96)');
+  txt('CONTROLS', W / 2, 52, '#ffe066', 16, 'center');
+  CONTROLS.forEach(([a, b], i) => {
+    const y = 80 + i * 15;
+    if (!b) txt(a, 100, y, '#c9a94a'); else { txt(a, 110, y, '#cfe3c5'); txt(b, 540, y, '#fff', 8, 'right'); }
+  });
+  txt('Golf: press A three times — start, set POWER, then ACCURACY at the yellow line.', W / 2, 296, '#9fb39a', 8, 'center', null);
+  txt('B / Esc to close', W / 2, 308, '#666', 8, 'center', null);
+}
+
+// ---------------- title ----------------
+function drawCourseBG(t) {
+  sky('#6fc0ee', '#bfe6fa', 190); cloud(80, 50); cloud(430, 34); cloud(560, 80);
+  R(0, 150, W, 40, '#4a9a40'); bush(40, 142, 120); bush(480, 140, 150);
+  R(0, 180, W, 180, '#3f8f3a'); ctx.fillStyle = '#6cc25a'; ctx.beginPath(); ctx.ellipse(470, 250, 170, 50, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#5bb24c'; ctx.beginPath(); ctx.ellipse(470, 250, 170, 50, 0, 0, Math.PI); ctx.fill();
+  R(0, 330, W, 30, '#357a31');
+  R(520, 196, 3, 56, '#fff'); ctx.fillStyle = '#e53935'; ctx.beginPath(); ctx.moveTo(523, 196); ctx.lineTo(546, 202 + Math.sin(t * 4) * 2); ctx.lineTo(523, 208); ctx.fill();
+  ctx.fillStyle = '#111'; ctx.beginPath(); ctx.ellipse(521, 252, 6, 2, 0, 0, 7); ctx.fill();
+}
+const Title = {
+  i: 0, ctrl: false, t: 0,
+  enter() { this.i = 0; this.ctrl = false; playSong('title'); },
+  opts() { return hasSave() ? ['Continue', 'New Game', 'Controls'] : ['New Game', 'Controls']; },
+  update(dt, blocked) {
+    this.t += dt; if (blocked || BUSY) return;
+    if (this.ctrl) { if (hit('b') || hit('a')) { this.ctrl = false; SFX.no(); } return; }
+    const o = this.opts();
+    if (rep('up')) { this.i = (this.i + o.length - 1) % o.length; SFX.move(); }
+    if (rep('down')) { this.i = (this.i + 1) % o.length; SFX.move(); }
+    if (hit('a')) {
+      SFX.ok(); const c = o[this.i];
+      if (c === 'Controls') this.ctrl = true;
+      else if (c === 'New Game') run(startNew);
+      else if (c === 'Continue') run(continueGame);
+    }
+  },
+  draw() {
+    drawCourseBG(this.t);
+    const pop = Math.max(0, Math.sin(this.t * .9)) ;
+    ctx.save(); ctx.beginPath(); ctx.rect(480, 200, 80, 52); ctx.clip(); drawGopher(521, 252 + (1 - pop) * 50, 3, pop > .9); ctx.restore();
+    bigTitle('CADDYSHACK', W / 2, 52, 40, '#ffe066', '#c0392b');
+    bigTitle('THE GAME', W / 2, 104, 16, '#ffffff', '#1f8a45');
+    drawPerson(150, 300, CH.kip.sp, 1, 0);
+    drawPerson(96, 300, CH.carl.sp, 1, 0);
+    const o = this.opts();
+    panel(220, 180, 200, 24 + o.length * 20);
+    o.forEach((s, i) => { const y = 194 + i * 20; if (i === this.i) { R(232, y - 4, 176, 16, '#2f5d36'); txt('►', 240, y, '#ffe066'); } txt(s, 262, y, i === this.i ? '#fff' : '#a8c49a'); });
+    txt('Keyboard or gamepad  ·  Z/Enter/A to select', W / 2, 322, '#e8f0d8', 8, 'center');
+    txt('An unofficial fan tribute. Summer 1980, Bushwood Country Club.', W / 2, 338, '#bfe6c0', 8, 'center');
+    if (this.ctrl) drawControls();
+  },
+};
+async function startNew() {
+  newGame(); await fadeOut(.5);
+  setScene(IntroScene); playSong('adv'); await fadeIn(.5);
+  for (const line of INTRO) { IntroScene.line = line; await say('nar', line); }
+  await fadeOut(.4); enterRoom('caddyshack', 150, 1); await fadeIn(.4);
+}
+async function continueGame() {
+  if (!loadGame()) return startNew();
+  await fadeOut(.4);
+  if (G.inTourney) { fadeIn(.3); await runTourney(); return; }
+  if (G.stage === 1) { fadeIn(.3); await judgeHole(); return; }
+  enterRoom(G.room || 'caddyyard', G.x || 150, 1); await fadeIn(.4);
+}
+const INTRO = [
+  'Summer, 1980. Bushwood Country Club.',
+  'Kip Kowalski is 17, broke, and the oldest of seven kids. His dad says college is for people with money.',
+  'But every summer, one lucky caddy wins the Bushwood Caddy Scholarship.',
+  'To get there, Kip needs tips, a sponsor, and a golf game good enough to shoot 24 over five holes.',
+  'First, though, he needs a job. And the caddyshack is run by Lou Loomis.',
+];
+const IntroScene = {
+  line: '', t: 0,
+  update(dt) { this.t += dt; },
+  draw() { drawCourseBG(this.t); R(0, 0, W, H, 'rgba(0,0,0,.35)'); bigTitle('BUSHWOOD', W / 2, 150, 32, '#ffe066', '#1f8a45'); drawPerson(W / 2, 320, CH.kip.sp, 1, this.t * .6); },
+};
+
+// ---------------- map ----------------
+const NODES = [
+  { id: 'yard', name: 'Caddyshack', x: 96, y: 262 },
+  { id: 'tee', name: 'First Tee', x: 262, y: 214 },
+  { id: 'pool', name: 'Pool & Snack Bar', x: 232, y: 98 },
+  { id: 'terrace', name: 'Clubhouse Terrace', x: 392, y: 116 },
+  { id: 'tourney', name: 'Caddy Tournament', x: 516, y: 178 },
+  { id: 'shed', name: "Carl's Shed", x: 552, y: 282 },
+];
+function nodeLock(id) {
+  if (id === 'pool' && G.stage < 3) return 'Members only. Caddies swim on Caddy Day. No reason to go there yet.';
+  if (id === 'terrace' && G.stage < 5) return 'The terrace is for members. You\'d need a very good reason.';
+  if (id === 'tourney' && G.stage < 6) return 'You need Judge Smails\' sponsorship to enter.';
+  return null;
+}
+function goalNode() {
+  switch (G.stage) {
+    case 2: return 'shed';
+    case 3: return (F.hoseGiven || has('hose')) ? 'shed' : 'pool';
+    case 4: return 'tee';
+    case 5: return 'terrace';
+    case 6: return 'tourney';
+  }
+  return null;
+}
+async function openMap() { await fadeOut(.3); setScene(MapScene); await fadeIn(.3); }
+const MapScene = {
+  pausable: true, cur: 0, kx: 96, ky: 262, t: 0,
+  enter() { playSong('adv'); const n = NODES[this.cur]; this.kx = n.x; this.ky = n.y; },
+  update(dt, blocked) {
+    this.t += dt;
+    const n = NODES[this.cur]; this.kx = lerp(this.kx, n.x, Math.min(1, dt * 10)); this.ky = lerp(this.ky, n.y, Math.min(1, dt * 10));
+    if (blocked || BUSY) return;
+    const dirs = { left: [-1, 0], right: [1, 0], up: [0, -1], down: [0, 1] };
+    for (const k in dirs) if (hit(k)) {
+      const [dx, dy] = dirs[k]; let best = -1, bs = 1e9;
+      NODES.forEach((m, i) => {
+        if (i === this.cur) return; const vx = m.x - n.x, vy = m.y - n.y, d = Math.hypot(vx, vy), dot = (vx * dx + vy * dy) / d;
+        if (dot < .3) return; const s = d * (2 - dot); if (s < bs) { bs = s; best = i; }
+      });
+      if (best >= 0) { this.cur = best; SFX.move(); }
+    }
+    if (hit('a')) run(() => this.go(NODES[this.cur]));
+  },
+  async go(n) {
+    const lock = nodeLock(n.id);
+    if (lock) { SFX.no(); await say('nar', lock); return; }
+    SFX.ok();
+    switch (n.id) {
+      case 'yard': return goRoom('caddyyard', 560, -1);
+      case 'shed': return goRoom('shed', 80, 1);
+      case 'pool': return goRoom('pool', 580, -1);
+      case 'terrace': return goRoom('terrace', 90, 1);
+      case 'tee': return teeEvent();
+      case 'tourney': return tournamentPrompt();
+    }
+  },
+  draw() {
+    R(0, 0, W, H, '#3f8f3a');
+    for (let i = 0; i < 300; i++) R(hash2(i, 4) * W, hash2(i, 5) * H, 2, 2, '#378532');
+    ctx.fillStyle = '#5fb24f';
+    for (const [x, y, rx, ry, a] of [[180, 200, 110, 26, -.3], [330, 250, 120, 22, .2], [470, 200, 90, 24, -.6], [140, 120, 80, 20, .4], [560, 110, 60, 30, 1]]) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, a, 0, 7); ctx.fill(); }
+    ctx.fillStyle = '#3f7fcf'; ctx.beginPath(); ctx.ellipse(470, 92, 58, 24, 0, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#d8c79a'; ctx.lineWidth = 5; ctx.beginPath();
+    ctx.moveTo(96, 262); ctx.lineTo(262, 214); ctx.lineTo(392, 116); ctx.lineTo(232, 98); ctx.moveTo(262, 214); ctx.lineTo(516, 178); ctx.lineTo(552, 282); ctx.moveTo(392, 116); ctx.lineTo(516, 178); ctx.stroke();
+    // buildings
+    R(330, 50, 124, 50, '#f4efe2'); R(322, 40, 140, 12, '#b0413e'); for (let x = 340; x < 450; x += 20) R(x, 62, 10, 14, '#3a5a8a');
+    R(200, 80, 66, 34, '#fff'); R(204, 84, 58, 26, '#4aa3e0');
+    R(66, 238, 60, 34, '#8a6a45'); R(60, 230, 72, 10, '#5a3a22');
+    R(528, 262, 50, 30, '#4a3520'); R(522, 254, 62, 10, '#2a1d10');
+    R(252, 206, 22, 14, '#64bc4e');
+    R(515, 140, 3, 38, '#fff'); ctx.fillStyle = '#ffe066'; ctx.beginPath(); ctx.moveTo(518, 140); ctx.lineTo(538, 146); ctx.lineTo(518, 152); ctx.fill();
+    for (const [x, y] of [[40, 40], [70, 60], [600, 40], [610, 200], [20, 180], [300, 320], [420, 330], [180, 330]]) { ctx.fillStyle = '#23602a'; ctx.beginPath(); ctx.arc(x, y, 14, 0, 7); ctx.fill(); }
+    const gn = goalNode();
+    NODES.forEach((n, i) => {
+      const lock = nodeLock(n.id);
+      ctx.fillStyle = lock ? '#555' : i === this.cur ? '#ffe066' : '#fff'; ctx.beginPath(); ctx.arc(n.x, n.y, 7, 0, 7); ctx.fill();
+      ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(n.x, n.y, 3, 0, 7); ctx.fill();
+      if (n.id === gn && Math.floor(this.t * 3) % 2) otxt('!', n.x, n.y - 24, '#ff5252', 16);
+      otxt(n.name, n.x, n.y + 11, lock ? '#999' : '#fff', 8);
+    });
+    const b = Math.abs(Math.sin(this.t * 5)) * 5;
+    R(this.kx - 5, this.ky - 22 - b, 10, 9, CH.kip.sp.skin); R(this.kx - 5, this.ky - 24 - b, 10, 4, CH.kip.sp.hair); R(this.kx - 6, this.ky - 13 - b, 12, 6, CH.kip.sp.bib);
+    R(0, 0, W, 18, 'rgba(0,0,0,.6)'); txt('BUSHWOOD COUNTRY CLUB', 8, 5, '#c9a94a'); txt('$' + G.money, W - 8, 5, '#9dff8a', 8, 'right');
+    const goal = goalText();
+    panel(0, H - 30, W, 30, 'rgba(0,0,0,.8)', '#3a4a2a');
+    txt('GOAL: ' + goal, W / 2, H - 24, '#fff', 8, 'center');
+    txt('Arrows / D-pad choose a place   Z / A go there', W / 2, H - 12, '#7fa36f', 8, 'center');
+  },
+};
+
+async function teeEvent() {
+  if (G.stage === 4) return czervikHole();
+  const c = await choose('The First Tee. Nobody needs a caddy right now. Play a practice hole?', ['Practice: Judge\'s Loop (par 4)', 'Practice: The Lake Hole (par 3)', 'Never mind'], 2);
+  if (c === 2) return;
+  const r = await playGolf(c === 0 ? 'judge' : 'czervik', {});
+  const d = r.strokes - HOLES[c === 0 ? 'judge' : 'czervik'].par;
+  await say('nar', 'Practice round: ' + r.strokes + ' strokes (' + (d === 0 ? 'even par' : d > 0 ? '+' + d : d) + ').');
+  await openMap();
+}
+async function czervikHole() {
+  const r = await playGolf('czervik', { pre: async () => {
+    await say('al', 'Hey! You the caddy? Great! Al Czervik. Listen, I got a proposition.');
+    await say('al', 'I hit it, you hit it, who cares. YOU hit it. Par this hole and I pay you fifty bucks. Bogey, ten. Worse, I laugh at you.');
+    await sayK('Mr. Czervik, I\'m supposed to carry your bag.');
+    await say('al', 'Kid, the bag carries itself. It\'s got a motor. Hit the ball! And watch the lake, it\'s full of Judge Smails\' golf balls.');
+  } });
+  const d = r.strokes - 3;
+  if (d < 0) await say('al', 'A BIRDIE?! Kid, you\'re a natural! Fifty bucks, and I\'m telling everybody!');
+  else if (d === 0) await say('al', 'PAR! Pay the man! Hey, Judge! You see that? That\'s a caddy with GAME!');
+  else if (d === 1) await say('al', 'Bogey! Eh, ten bucks. Buy yourself a lesson. Or a hot dog.');
+  else await say('al', 'Ha ha ha! Oof. Don\'t worry, kid, I once shot a 12 on a par 3. On purpose. For a bet.');
+  addMoney(d <= 0 ? 50 : d === 1 ? 10 : 5);
+  G.stage = 5; saveGame();
+  await say('al', 'I\'ll be up on the clubhouse terrace. Terrible food, great view. Come say hi!');
+  await say('nar', 'Time to ask about that tournament. Judge Smails holds court on the Clubhouse Terrace.');
+  await openMap();
+}
+
+// ---------------- tournament ----------------
+const RIVALS = [["Tony D'Annunzio", [5, 4, 5, 5, 6]], ['Motormouth', [5, 3, 6, 6, 6]], ['Porterhouse', [4, 4, 7, 5, 7]]];
+const PARS = TOURNEY.map(id => HOLES[id].par);
+function tSum(n) { let s = 0; for (let i = 0; i < n; i++) s += G.tScores[i] || 0; return s; }
+function relStr(v) { return v === 0 ? 'E' : v > 0 ? '+' + v : '' + v; }
+async function tournamentPrompt() {
+  const c = await choose('Tee off in the Bushwood Caddy Scholarship Tournament? Five holes, no do-overs. Shoot 24 or better to win.', ['Tee it up!', 'Not yet'], 1);
+  if (c !== 0) return;
+  G.tScores = []; G.tHole = 0;
+  await runTourney();
+}
+async function runTourney() {
+  G.inTourney = 1; saveGame();
+  const pre = {
+    0: async () => {
+      await say('lou', 'Ladies and gentlemen, welcome to the Bushwood Caddy Scholarship Tournament! Five holes! Par twenty!');
+      await say('lou', 'Shoot twenty-four or better and you go to college. Shoot worse and you go back to carrying bags. Kowalski, you\'re up.');
+      await say('smails', 'Don\'t embarrass me, boy. I sponsored you. I have a reputation.');
+    },
+    2: async () => { await say('carl', '(from the bushes) Psst. Kid. The gopher lives on this hole. Watch the creek. And the gopher. Mostly the gopher.'); },
+    4: async () => {
+      await say('nar', 'Black clouds roll over Bushwood. Thunder rumbles. The wind is howling left to right.');
+      await say('lou', 'Nobody leaves till it\'s done! The last guy who quit in a storm like this was a bishop. Lightning. Don\'t ask.');
+    },
+  };
+  for (let i = G.tHole; i < 5; i++) {
+    const r = await playGolf(TOURNEY[i], { song: 'tourney', pre: pre[i], tourney: () => 'thru ' + i + ': ' + relStr(tSum(i) - PARS.slice(0, i).reduce((a, b) => a + b, 0)) });
+    G.tScores[i] = r.strokes; G.tHole = i + 1; saveGame();
+    await showScorecard(i + 1);
+  }
+  const total = tSum(5);
+  G.inTourney = 0; G.tHole = 0; G.stage = 7; saveGame();
+  if (total <= 24) await winEnding(total); else await loseEnding(total);
+}
+function showScorecard(n) {
+  return new Promise(async res => {
+    await fadeOut(.25);
+    setScene({
+      update(dt, blocked) { if (!blocked && hit('a')) { SFX.ok(); res(); } },
+      draw() {
+        R(0, 0, W, H, '#1c421a');
+        R(60, 30, 520, 300, '#f6f1dc'); R(60, 30, 520, 26, '#1f5a2e'); txt('BUSHWOOD CADDY SCHOLARSHIP · SCORECARD', W / 2, 39, '#ffe066', 8, 'center', null);
+        const cx = i => 250 + i * 50;
+        txt('HOLE', 80, 70, '#333', 8, 'left', null); TOURNEY.forEach((id, i) => txt('' + HOLES[id].num, cx(i), 70, '#333', 8, 'center', null)); txt('TOT', 520, 70, '#333', 8, 'center', null);
+        txt('PAR', 80, 88, '#333', 8, 'left', null); PARS.forEach((p, i) => txt('' + p, cx(i), 88, '#333', 8, 'center', null)); txt('20', 520, 88, '#333', 8, 'center', null);
+        R(76, 100, 488, 2, '#1f5a2e');
+        const rows = [['KIP KOWALSKI', G.tScores]].concat(RIVALS);
+        rows.forEach(([name, sc], r) => {
+          const y = 112 + r * 22, me = r === 0;
+          if (me) R(72, y - 5, 496, 18, '#fff3b0');
+          txt(name, 80, y, me ? '#b0413e' : '#333', 8, 'left', null);
+          for (let i = 0; i < n; i++) {
+            const s = sc[i], d = s - PARS[i];
+            if (me && d < 0) { ctx.strokeStyle = '#b0413e'; ctx.beginPath(); ctx.arc(cx(i), y + 3, 8, 0, 7); ctx.stroke(); }
+            if (me && d > 0) { ctx.strokeStyle = '#333'; ctx.strokeRect(cx(i) - 8, y - 5, 16, 16); }
+            txt('' + s, cx(i), y, '#333', 8, 'center', null);
+          }
+          let t = 0; for (let i = 0; i < n; i++) t += sc[i];
+          txt('' + t, 520, y, '#333', 8, 'center', null);
+        });
+        const tot = tSum(n), parN = PARS.slice(0, n).reduce((a, b) => a + b, 0);
+        txt('Kip: ' + tot + ' thru ' + n + '  (' + relStr(tot - parN) + ')', W / 2, 210, '#1f5a2e', 16, 'center', null);
+        const need = 24 - tot, left = 5 - n, parLeft = PARS.slice(n).reduce((a, b) => a + b, 0);
+        txt(n < 5 ? (need - parLeft >= 0 ? 'Need ' + need + ' or fewer on the last ' + left + ' (' + relStr(need - parLeft) + ' vs par) to win.' : 'Need ' + need + ' on the last ' + left + '. That\'s ' + relStr(need - parLeft) + '. Miracle time.') : (tot <= 24 ? 'WINNING SCORE!' : 'Winning score was 24...'), W / 2, 244, '#333', 8, 'center', null);
+        txt('Score to beat: 24 (+4)', W / 2, 264, '#b0413e', 8, 'center', null);
+        if (Math.floor(performance.now() / 400) % 2) txt('Press Z / A to continue', W / 2, 300, '#555', 8, 'center', null);
+      },
+    });
+    playSong('tourney');
+    fadeIn(.25);
+  });
+}
+
+// ---------------- endings ----------------
+function endScene(drawFn) { const s = { t: 0, update(dt) { this.t += dt; }, draw() { drawFn(this.t); } }; setScene(s); return s; }
+async function winEnding(total) {
+  await fadeOut(.4);
+  endScene(t => {
+    drawCourseBG(t);
+    const cast = [['lou', 90], ['smails', 170], ['ty', 250], ['kip', 330], ['al', 410], ['carl', 490], ['lacey', 560]];
+    cast.forEach(([id, x], i) => drawPerson(x, 320 - (id === 'kip' ? Math.abs(Math.sin(t * 6)) * 12 : 0), CH[id].sp, i < 3 ? 1 : -1, 0, { talk: DLG.cur && DLG.cur.who === id }));
+    drawGopher(610, 330, 3, true);
+    for (let i = 0; i < 40; i++) { const x = (hash2(i, 1) * W + t * 30 * (hash2(i, 2) - .5)) % W, y = (hash2(i, 3) * 200 + t * 60 * (.5 + hash2(i, 4))) % 240; R(x, y, 4, 4, ['#ffe066', '#e53935', '#4aa3ff', '#fff'][i % 4]); }
+  });
+  playSong('title'); SFX.cheer(); await fadeIn(.5);
+  await say('lou', 'Final score for Kip Kowalski: ' + total + '! THAT\'S A WINNER! Pinky, pay up!');
+  await say('smails', 'Well. Congratulations, Kowalski. I suppose. The scholarship is yours.');
+  await say('smails', '...I always knew you had it in you. Somewhere. Deep down. Very deep.');
+  await say('ty', 'Nice.');
+  await say('al', 'THAT\'S my caddy! Drinks for everybody! Put it on the Judge\'s tab!');
+  await say('carl', 'Cinderella story. Outta nowhere. Heh heh heh. ...I still gotta get that gopher.');
+  await say('nar', 'Kip Kowalski: Bushwood Caddy Scholar. Class of 1984. Tips earned this summer: $' + G.money + '.');
+  await say('nar', 'THE END.  (And somewhere under the 12th green, a gopher is dancing.)');
+  await backToTitle();
+}
+async function loseEnding(total) {
+  await fadeOut(.6);
+  endScene(t => {
+    R(0, 0, W, H, '#000');
+    if (t < 9999 && !LOSE.quote) drawPerson(W / 2, 250, CH.smails.sp, 1, 0, { talk: DLG.cur && DLG.cur.who === 'smails' });
+    if (LOSE.quote) {
+      const a = Math.min(1, (t - LOSE.qt) / 2);
+      ctx.globalAlpha = a;
+      txt('"The world needs', W / 2, 120, '#fff', 16, 'center');
+      txt('ditch-diggers too."', W / 2, 150, '#fff', 16, 'center');
+      txt('— Judge Elihu Smails', W / 2, 200, '#8fb8ff', 8, 'center');
+      ctx.globalAlpha = Math.max(0, Math.min(1, (t - LOSE.qt - 2.5) / 1.5));
+      txt('GAME OVER  ·  Final score ' + total + ' (' + relStr(total - 20) + ')', W / 2, 260, '#c0392b', 8, 'center');
+      ctx.globalAlpha = 1;
+    }
+  });
+  const LS = SCENE;
+  playSong('sad'); SFX.fail(); await fadeIn(.6);
+  await say('smails', 'Final score: ' + total + '. Well, well, well, Kowalski.');
+  await say('smails', 'I sponsored you. I vouched for you. And you shot ' + total + '.');
+  await say('smails', 'Don\'t feel too bad, boy. Some people go to college, and some people...');
+  LOSE.quote = true; LOSE.qt = LS.t;
+  await wait(4.5);
+  const c = await choose('Try again?', ['Replay the tournament', 'Back to title'], 1);
+  LOSE.quote = false;
+  if (c === 0) { G.stage = 6; G.tScores = []; G.tHole = 0; saveGame(); await runTourney(); }
+  else await backToTitle();
+}
+const LOSE = { quote: false, qt: 0 };
+async function backToTitle() { await fadeOut(.5); setScene(Title); await fadeIn(.5); }
+
+// ---------------- pause ----------------
+const PAUSE = { on: false, i: 0, ctrl: false };
+function updatePause() {
+  if (PAUSE.ctrl) { if (hit('b') || hit('a') || hit('start')) PAUSE.ctrl = false; return; }
+  const o = ['Resume', 'Controls', 'Sound: ' + (muted ? 'OFF' : 'ON'), 'Quit to Title'];
+  if (rep('up')) { PAUSE.i = (PAUSE.i + 3) % 4; SFX.move(); }
+  if (rep('down')) { PAUSE.i = (PAUSE.i + 1) % 4; SFX.move(); }
+  if (hit('b') || hit('start')) { PAUSE.on = false; return; }
+  if (hit('a')) {
+    SFX.ok();
+    if (PAUSE.i === 0) PAUSE.on = false;
+    if (PAUSE.i === 1) PAUSE.ctrl = true;
+    if (PAUSE.i === 2) toggleMute();
+    if (PAUSE.i === 3) { PAUSE.on = false; DLG.cur = null; CHOICE.cur = null; TIMERS = []; BUSY = 0; FADE.a = 0; FADE.to = 0; FADE.res = null; setScene(Title); }
+  }
+}
+function drawPause() {
+  R(0, 0, W, H, 'rgba(0,0,0,.6)');
+  const o = ['Resume', 'Controls', 'Sound: ' + (muted ? 'OFF' : 'ON'), 'Quit to Title'];
+  panel(220, 110, 200, 120);
+  txt('PAUSED', W / 2, 122, '#ffe066', 8, 'center');
+  o.forEach((s, i) => { const y = 146 + i * 18; if (i === PAUSE.i) { R(232, y - 4, 176, 15, '#2f5d36'); txt('►', 240, y, '#ffe066'); } txt(s, 262, y, i === PAUSE.i ? '#fff' : '#a8c49a'); });
+  txt('Progress saves automatically.', W / 2, 238, '#9fb39a', 8, 'center');
+  if (PAUSE.ctrl) drawControls();
+}
+Golf.pausable = true;
+
+// ---------------- loop ----------------
+let lastT = 0;
+const bootEl = document.getElementById('boot');
+function frame(ts, manual) {
+  if (ts <= lastT) { if (!manual) requestAnimationFrame(frame); return; }
+  const dt = Math.min(.05, (ts - lastT) / 1000 || 0); lastT = ts; lastDt = dt;
+  pollInput(dt);
+  if (bootEl && ACTS.some(a => IN.down[a])) bootEl.style.display = 'none';
+  if (hit('mute')) toggleMute();
+  if (hit('full')) { try { document.fullscreenElement ? document.exitFullscreen() : cv.requestFullscreen(); } catch (e) { } }
+  if (PAUSE.on) updatePause();
+  else {
+    if (SCENE && SCENE.pausable && !DLG.cur && !CHOICE.cur && hit('start')) { PAUSE.on = true; PAUSE.i = 0; SFX.ok(); }
+    updateTimers(dt);
+    if (CHOICE.cur) updateChoice(); else if (DLG.cur) updateDlg(dt);
+    if (SCENE) SCENE.update(dt, !!(DLG.cur || CHOICE.cur));
+  }
+  updateFade(dt);
+  ctx.imageSmoothingEnabled = false;
+  if (SCENE) SCENE.draw();
+  drawDlg(); drawChoice(); drawToasts(PAUSE.on ? 0 : dt);
+  if (PAUSE.on) drawPause();
+  if (FADE.a > 0) R(0, 0, W, H, 'rgba(0,0,0,' + FADE.a + ')');
+  if (!manual) requestAnimationFrame(frame);
+}
+function boot() {
+  setScene(Title); requestAnimationFrame(frame); cv.focus();
+  // watchdog: keep the game ticking in embedded views that pause animation frames
+  setInterval(() => { const n = performance.now(); if (n - lastT > 80) frame(n, true); }, 33);
+}
+if (document.fonts && document.fonts.load) Promise.race([document.fonts.load('8px "Press Start 2P"'), new Promise(r => setTimeout(r, 1500))]).then(boot, boot);
+else boot();
+
+</script>
+
+</body></html>
