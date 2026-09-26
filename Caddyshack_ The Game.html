@@ -31,6 +31,9 @@ function fit() {
 }
 addEventListener('resize', fit); fit();
 cv.addEventListener('mousedown', () => { cv.focus(); audioInit(); });
+addEventListener('pointerdown', () => audioInit());
+addEventListener('touchend', () => audioInit());
+const audioOn = () => !!AC && AC.state === 'running';
 
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -140,7 +143,8 @@ function audioInit() {
   try {
     if (!AC) {
       AC = new (window.AudioContext || window.webkitAudioContext)();
-      MASTER = AC.createGain(); MASTER.gain.value = .7; MASTER.connect(AC.destination);
+      const comp = AC.createDynamicsCompressor(); comp.connect(AC.destination);
+      MASTER = AC.createGain(); MASTER.gain.value = 1.6; MASTER.connect(comp);
     }
     if (AC.state === 'suspended') AC.resume();
   } catch (e) { }
@@ -214,8 +218,8 @@ setInterval(() => {
   while (songNext < AC.currentTime + .2) {
     const i = songStep % SONG.mel.length, m = SONG.mel[i], b = SONG.bass[i % SONG.bass.length];
     const d = songNext - AC.currentTime;
-    if (m) tone(mfreq(m), st * .85, SONG.wave || 'square', .018, null, d);
-    if (b) tone(mfreq(b), st * .9, 'triangle', .045, null, d);
+    if (m) tone(mfreq(m), st * .85, SONG.wave || 'square', .045, null, d);
+    if (b) tone(mfreq(b), st * .9, 'triangle', .11, null, d);
     songStep++; songNext += st;
   }
 }, 40);
@@ -2472,6 +2476,12 @@ function frame(ts, manual) {
   if (SCENE) SCENE.draw();
   drawDlg(); drawChoice(); drawToasts(PAUSE.on ? 0 : dt);
   if (PAUSE.on) drawPause();
+  if (!muted && !audioOn() && Math.floor(ts / 600) % 3) {
+    // browsers block audio until a click or key press; a gamepad button doesn't count
+    const msg = 'SOUND IS OFF: click the game or press any key';
+    R(W - msg.length * 8 - 20, 24, msg.length * 8 + 14, 16, 'rgba(0,0,0,.85)');
+    txt(msg, W - 13, 28, '#ffe066', 8, 'right', null);
+  }
   if (FADE.a > 0) R(0, 0, W, H, 'rgba(0,0,0,' + FADE.a + ')');
   if (!manual) requestAnimationFrame(frame);
 }
